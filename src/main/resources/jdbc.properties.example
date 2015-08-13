@@ -1,0 +1,13 @@
+# Production DB userdata connection properties
+jdbc.driverClassName=com.mysql.jdbc.Driver
+jdbc.userdata.url=jdbc:mysql://mysql_host/userdata?characterEncoding\=UTF-8&useUnicode\=true
+jdbc.userdata.username=
+jdbc.userdata.password=
+# Production doccache connection properties
+jdbc.doccache.url=jdbc:mysql://mysql_host/doccache?characterEncoding\=UTF-8&useUnicode\=true
+jdbc.doccache.username=
+jdbc.doccache.password=
+# Production dictionary connection properties
+jdbc.dictionary.url=jdbc:mysql://mysql_host/new_dictionary?characterEncoding\=UTF-8&useUnicode\=true
+jdbc.dictionary.username=
+jdbc.dictionary.password=

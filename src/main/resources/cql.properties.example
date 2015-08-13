@@ -1,0 +1,5 @@
+cassandra.contactpoints=cassandra server hostnames
+cassandra.port=9042
+cassandra.user=
+cassandra.password=
+cassandra.keyspace=doccache
