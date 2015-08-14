@@ -187,6 +187,7 @@ $RECYCLE.BIN/
 #  Maven
 ##############################
 target/
+*.class
 
 ##############################
 # IntellyJ Idea
@@ -194,7 +195,7 @@ target/
 workspace.xml
 tasks.xml
 .idea/
-factbook-search.iml
+*.iml
 
 
 #################################

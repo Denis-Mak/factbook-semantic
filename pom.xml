@@ -17,6 +17,7 @@
             <properties>
                 <cql.config.file>cql.properties</cql.config.file>
                 <jdbc.config.file>jdbc.properties</jdbc.config.file>
+                <service.log.level>DEBUG</service.log.level>
             </properties>
         </profile>
         <profile>
@@ -27,6 +28,7 @@
             <properties>
                 <cql.config.file>cql.staging.properties</cql.config.file>
                 <jdbc.config.file>jdbc.staging.properties</jdbc.config.file>
+                <service.log.level>DEBUG</service.log.level>
             </properties>
         </profile>
     </profiles>
