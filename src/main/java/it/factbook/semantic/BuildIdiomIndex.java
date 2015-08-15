@@ -1,12 +1,22 @@
 package it.factbook.semantic;
 
+import com.datastax.spark.connector.japi.CassandraRow;
 import org.apache.spark.SparkConf;
+import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
+import scala.Tuple2;
+import scala.Tuple3;
 
+import java.util.HashSet;
+import java.util.List;
 import java.util.Properties;
+import java.util.Set;
+import java.util.stream.Collectors;
 
-import static com.datastax.spark.connector.japi.CassandraJavaUtil.*;
+import static com.datastax.spark.connector.japi.CassandraJavaUtil.classTag;
+import static com.datastax.spark.connector.japi.CassandraJavaUtil.javaFunctions;
+import static com.datastax.spark.connector.japi.CassandraJavaUtil.mapToRow;
 
 public class BuildIdiomIndex {
 
@@ -25,22 +35,25 @@ public class BuildIdiomIndex {
         String _keySpace = config.getProperty("cassandra.keyspace");
         JavaSparkContext sc = new JavaSparkContext(conf);
 
-        JavaRDD<SemanticIndexRow> uniqueIdioms = javaFunctions(sc)
+        JavaPairRDD<Tuple3<Integer, String, String>, Iterable<CassandraRow>> idiomsGroupedByVector = javaFunctions(sc)
                 .cassandraTable(_keySpace, "semantic_index_v2")
-                .select("golem", "random_index", "idiom")
-                .map(row -> {
+                .select("golem", "random_index", "mem", "idiom")
+                .<Tuple3<Integer, String, String>>spanBy(
+                        row -> new Tuple3(row.getInt("golem"), row.getString("random_index"), row.getString("mem")),
+                        classTag(Tuple3.class));
+        JavaRDD<SemanticIndexRow> uniqueIdioms = idiomsGroupedByVector
+                .map(group -> {
+                    Set<String> idiomsOfTheGroup = new HashSet<>();
+                    group._2().forEach(row -> idiomsOfTheGroup.add(row.getString("idiom")));
                     SemanticIndexRow semanticIndexRow = new SemanticIndexRow();
-                    semanticIndexRow.setGolem(row.getInt(0));
-                    semanticIndexRow.setRandomIndex(row.getString(1));
-                    semanticIndexRow.setIdiom(row.getString(2));
+                    semanticIndexRow.setGolem(group._1()._1());
+                    semanticIndexRow.setRandomIndex(group._1()._2());
+                    semanticIndexRow.setMem(group._1()._3());
+                    semanticIndexRow.setIdiom(idiomsOfTheGroup.stream().collect(Collectors.joining("; ")));
                     return semanticIndexRow;
-                })
-                .distinct();
-
+                });
         javaFunctions(uniqueIdioms)
                 .writerBuilder(_keySpace, "idiom_v2", mapToRow(SemanticIndexRow.class))
                 .saveToCassandra();
-
-        System.out.println("Job is done.");
     }
 }

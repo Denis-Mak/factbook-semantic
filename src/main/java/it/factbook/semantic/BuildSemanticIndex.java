@@ -113,8 +113,6 @@ public class BuildSemanticIndex {
         javaFunctions(idiomsInFacts)
                 .writerBuilder(_keySpace, "semantic_index_v2", mapToRow(SemanticIndexRow.class))
                 .saveToCassandra();
-
-        System.out.println("Job is done.");
     }
 
 

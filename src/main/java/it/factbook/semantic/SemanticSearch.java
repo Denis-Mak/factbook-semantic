@@ -1,9 +1,5 @@
 package it.factbook.semantic;
 
-import com.esotericsoftware.kryo.Kryo;
-import com.esotericsoftware.kryo.KryoSerializable;
-import com.esotericsoftware.kryo.io.Input;
-import com.esotericsoftware.kryo.io.Output;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import it.factbook.dictionary.Stem;
@@ -11,16 +7,13 @@ import it.factbook.search.SearchProfile;
 import it.factbook.search.repository.Match;
 import it.factbook.util.BitUtils;
 import org.apache.spark.SparkConf;
-import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
-import org.apache.spark.rdd.RDD;
 import org.apache.spark.storage.StorageLevel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import scala.Tuple2;
-import scala.collection.Map;
 
 import java.io.*;
 import java.net.ServerSocket;
@@ -42,6 +35,7 @@ public class SemanticSearch {
         SparkConf conf = new SparkConf();
         conf.setAppName("Semantic Search");
         conf.setMaster(config.getProperty("spark.master"));
+        conf.set("spark.executor.memory", config.getProperty("spark.executor.memory"));
         conf.set("spark.cassandra.connection.host", config.getProperty("cassandra.host"));
         conf.set("spark.cassandra.auth.username", config.getProperty("cassandra.user"));
         conf.set("spark.cassandra.auth.password", config.getProperty("cassandra.password"));
@@ -97,17 +91,17 @@ public class SemanticSearch {
                 .persist(StorageLevel.MEMORY_AND_DISK_SER());
 
         JavaRDD<IdiomKey> foundVectorsRDD = allVectors
-                .filter(vector -> vector.golem == golemId)
+                .filter(vector -> vector.getGolem() == golemId)
                 .flatMap(vector -> {
                     List<IdiomKey> foundVectors = new ArrayList<>();
                     for (IdiomKey searchKey : searchKeys) {
                         int commonMems = 0;
-                        if (BitUtils.getHammingDistance(vector.boolVector, searchKey.boolVector) < 34 &&
-                                (commonMems = commonMems(searchKey.mem, vector.mem)) > 4) {
+                        if (BitUtils.getHammingDistance(vector.getBoolVector(), searchKey.boolVector) < 34 &&
+                                (commonMems = commonMems(searchKey.mem, vector.getMem())) > 4) {
                             foundVectors.add(new IdiomKey(
-                                    vector.golem,
-                                    vector.boolVector,
-                                    vector.mem,
+                                    vector.getGolem(),
+                                    vector.getBoolVector(),
+                                    vector.getMem(),
                                     searchKey.weight,
                                     commonMems
                             ));
@@ -298,66 +292,4 @@ public class SemanticSearch {
         }
     }
 
-    public static class SemanticVector implements Serializable, KryoSerializable {
-        private int golem;
-        private boolean[] boolVector;
-        private int[] mem;
-
-        public SemanticVector(int golem, boolean[] boolVector, int[] mem) {
-            this.golem = golem;
-            this.boolVector = boolVector;
-            this.mem = mem;
-        }
-
-        public int getGolem() {
-            return golem;
-        }
-
-        public void setGolem(int golem) {
-            this.golem = golem;
-        }
-
-        public boolean[] getBoolVector() {
-            return boolVector;
-        }
-
-        public void setBoolVector(boolean[] boolVector) {
-            this.boolVector = boolVector;
-        }
-
-        public int[] getMem() {
-            return mem;
-        }
-
-        public void setMem(int[] mem) {
-            this.mem = mem;
-        }
-
-        @Override
-        public void write(Kryo kryo, Output output) {
-            output.writeByte(golem);
-            for (byte each: BitUtils.convertToByteArray(boolVector)){
-                output.writeByte(each);
-            }
-            for (int each: mem){
-                output.writeInt(each);
-            }
-        }
-
-        @Override
-        public void read(Kryo kryo, Input input) {
-            golem = input.readByte();
-            boolVector = new boolean[Stem.RI_VECTOR_LENGTH];
-            int byteVectorSize = Stem.RI_VECTOR_LENGTH / Byte.SIZE;
-            byte[] bytes = new byte[byteVectorSize];
-            for (int i = 0; i < byteVectorSize; i++){
-                bytes[i] = input.readByte();
-            }
-            boolVector = BitUtils.convertToBits(bytes);
-            mem = new int[Stem.MEM_VECTOR_LENGTH];
-            for (int i = 0; i < Stem.MEM_VECTOR_LENGTH; i++){
-                mem[i] = input.readInt();
-            }
-        }
-    }
 }
