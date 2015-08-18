@@ -31,6 +31,17 @@
                 <service.log.level>DEBUG</service.log.level>
             </properties>
         </profile>
+        <profile>
+            <id>test</id>
+            <activation>
+                <activeByDefault>true</activeByDefault>
+            </activation>
+            <properties>
+                <cql.config.file>cql.test.properties</cql.config.file>
+                <jdbc.config.file>jdbc.test.properties</jdbc.config.file>
+                <service.log.level>DEBUG</service.log.level>
+            </properties>
+        </profile>
     </profiles>
     <dependencies>
         <dependency>
@@ -40,7 +51,7 @@
             <exclusions>
                 <exclusion>
                     <groupId>it.factbook</groupId>
-                    <artifactId>factbook-dictionary</artifactId>
+                    <artifactId>factbook-core</artifactId>
                 </exclusion>
                 <exclusion>
                     <groupId>com.fasterxml.jackson.core</groupId>

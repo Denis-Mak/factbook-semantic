@@ -2,8 +2,10 @@ package it.factbook.semantic;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.joda.JodaModule;
 import it.factbook.dictionary.Stem;
 import it.factbook.search.SearchProfile;
+import it.factbook.search.repository.FactKey;
 import it.factbook.search.repository.Match;
 import it.factbook.util.BitUtils;
 import org.apache.spark.SparkConf;
@@ -28,7 +30,13 @@ import static com.datastax.spark.connector.japi.CassandraJavaUtil.*;
 
 public class SemanticSearch {
     private static final ObjectMapper jsonMapper = new ObjectMapper();
-    private static final Logger log = LoggerFactory.getLogger(Util.class);
+    static {
+        jsonMapper.registerModule(new JodaModule());
+    }
+    private static final Logger log = LoggerFactory.getLogger(SemanticSearch.class);
+    private static final int MAX_HAMMING_DIST = 34;
+    private static final int MIN_COMMON_MEMS = 4;
+    private static String _keySpace = "doccache";
 
     public static void main(String[] args) {
         Properties config = Util.readProperties();
@@ -41,11 +49,22 @@ public class SemanticSearch {
         conf.set("spark.cassandra.auth.password", config.getProperty("cassandra.password"));
         int _semanticSearchPort = Integer.parseInt(config.getProperty("semantic.search.port"));
         conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer");
+        _keySpace = config.getProperty("cassandra.keyspace");
         //conf.set("spark.kryo.registrationRequired", "true");
         conf.registerKryoClasses(new Class[]{IdiomKey.class, SemanticSearchMatch.class, SemanticVector.class,
                 SemanticSearchKeyComparator.class});
         JavaSparkContext sc = new JavaSparkContext(conf);
-
+        JavaRDD<SemanticVector> allVectors = javaFunctions(sc)
+                .cassandraTable(_keySpace, "idiom_v2")
+                .select("golem", "random_index", "mem")
+                .map(row -> new SemanticVector(
+                        row.getInt(0),
+                        BitUtils.reverseHash(row.getString(1), Stem.RI_VECTOR_LENGTH),
+                        jsonMapper.readValue(row.getString(2), new TypeReference<int[]>() {
+                        })))
+                .cache();
+        long count = allVectors.count();
+        log.debug("All vectors count {}", count);
 
         final int golemId = 1;
         try (ServerSocket serverSocket = new ServerSocket(_semanticSearchPort)) {
@@ -62,10 +81,10 @@ public class SemanticSearch {
                             List<IdiomKey> searchKeys = profile.getLines().stream()
                                     .map(line -> new IdiomKey(line.getGolem().getId(), line.getRandomIndex(), line.getMem(), line.getWeight(), 0))
                                     .collect(Collectors.toList());
-                            List<Match> matches = search(sc, golemId, searchKeys);
+                            List<Match> matches = search(sc, allVectors, golemId, searchKeys);
                             out.println(jsonMapper.writeValueAsString(matches));
                         } catch (IOException e) {
-                            log.error("Error parse SearchProfile.class JSON: {}", inputLine.substring(0, 1000));
+                            log.error("Error parse SearchProfile.class JSON: {}", e);
                         }
 
                     }
@@ -79,25 +98,15 @@ public class SemanticSearch {
         }
     }
 
-    private static List<Match> search(JavaSparkContext sc, int golemId, List<IdiomKey> searchKeys){
-        JavaRDD<SemanticVector> allVectors = javaFunctions(sc)
-                .cassandraTable("doccache", "idiom_v2")
-                .select("golem", "random_index", "mem")
-                .map(row -> new SemanticVector(
-                        row.getInt(0),
-                        BitUtils.reverseHash(row.getString(1), Stem.RI_VECTOR_LENGTH),
-                        jsonMapper.readValue(row.getString(2), new TypeReference<int[]>() {
-                        })))
-                .persist(StorageLevel.MEMORY_AND_DISK_SER());
-
+    private static List<Match> search(JavaSparkContext sc, JavaRDD<SemanticVector> allVectors, int golemId, List<IdiomKey> searchKeys){
         JavaRDD<IdiomKey> foundVectorsRDD = allVectors
                 .filter(vector -> vector.getGolem() == golemId)
                 .flatMap(vector -> {
                     List<IdiomKey> foundVectors = new ArrayList<>();
                     for (IdiomKey searchKey : searchKeys) {
                         int commonMems = 0;
-                        if (BitUtils.getHammingDistance(vector.getBoolVector(), searchKey.boolVector) < 34 &&
-                                (commonMems = commonMems(searchKey.mem, vector.getMem())) > 4) {
+                        if (BitUtils.getHammingDistance(vector.getBoolVector(), searchKey.boolVector) < MAX_HAMMING_DIST &&
+                                (commonMems = commonMems(searchKey.mem, vector.getMem())) > MIN_COMMON_MEMS) {
                             foundVectors.add(new IdiomKey(
                                     vector.getGolem(),
                                     vector.getBoolVector(),
@@ -124,13 +133,13 @@ public class SemanticSearch {
                 .collect(Collectors.toList());
 
         JavaPairRDD<IdiomKey,SemanticSearchMatch> matchesRDD = javaFunctions(sc.parallelize(collapsedByRandomIndex))
-                .joinWithCassandraTable("doccache", "semantic_index_v2",
+                .joinWithCassandraTable(_keySpace, "semantic_index_v2",
                         someColumns("golem", "url", "pos", "factuality", "fingerprint"),
                         someColumns("golem", "random_index"),
                         mapRowTo(SemanticSearchMatch.class),
                         mapToRow(IdiomKey.class));
 
-        return matchesRDD.collect().stream()
+        JavaPairRDD<FactKey, Match> groupedByFactKey = matchesRDD
                 .map(m -> {
                     int factuality = m._2().factuality;
                     int relevancy = new Long(Math.round(Math.log(1 + factuality) * m._1().weight * m._1().commonMems)).intValue();
@@ -142,7 +151,13 @@ public class SemanticSearch {
                     match.attrs.put("fingerprint", m._2().fingerprint);
                     return match;
                 })
-                .collect(Collectors.toList());
+                .keyBy(m -> new FactKey((String)m.attrs.get("url"), (int)m.attrs.get("pos")))
+                .reduceByKey((m1, m2) -> {
+                    m1.relevance = m1.relevance + m2.relevance;
+                    return m1;
+                });
+
+        return groupedByFactKey.map(Tuple2::_2).collect();
     }
 
     public static class SemanticSearchKeyComparator implements Comparator<IdiomKey>, Serializable {
