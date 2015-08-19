@@ -9,7 +9,7 @@ import static org.junit.Assert.assertEquals;
 
 public class TestSemanticVector {
     private static SemanticVector semanticVector =
-            new SemanticVector(1, "EA0TFiY3OEBCRkxaYGFpeXo=", "[57,3654,648,3764,477,847,458,593]");
+            new SemanticVector("EA0TFiY3OEBCRkxaYGFpeXo=", "[57,3654,648,3764,477,847,458,593]");
 
     @Test
     public void testSerialization(){

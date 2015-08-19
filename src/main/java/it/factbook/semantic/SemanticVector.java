@@ -16,28 +16,20 @@ import java.io.IOException;
 import java.io.Serializable;
 import java.util.Arrays;
 
-public class SemanticVector implements Serializable, KryoSerializable {
+public class SemanticVector implements Serializable{
     private static final ObjectMapper jsonMapper = new ObjectMapper();
     static {
         jsonMapper.registerModule(new JodaModule());
     }
     private static final Logger log = LoggerFactory.getLogger(SemanticVector.class);
 
-    private int golem;
-    private boolean[] boolVector;
+    private long[] boolVector;
     private int[] mem;
 
     public SemanticVector(){}
 
-    public SemanticVector(int golem, boolean[] boolVector, int[] mem) {
-        this.golem = golem;
-        this.boolVector = boolVector;
-        this.mem = mem;
-    }
-
-    public SemanticVector(int golem, String randomIndex, String mem) {
-        this.golem = golem;
-        this.boolVector = BitUtils.reverseHash(randomIndex, Stem.RI_VECTOR_LENGTH);
+    public SemanticVector(String randomIndex, String mem) {
+        this.boolVector = BitUtils.convertToLongArray(BitUtils.reverseHash(randomIndex, Stem.RI_VECTOR_LENGTH));
         try {
             this.mem = jsonMapper.readValue(mem, new TypeReference<int[]>() {});
         } catch (IOException e) {
@@ -45,19 +37,11 @@ public class SemanticVector implements Serializable, KryoSerializable {
         }
     }
 
-    public int getGolem() {
-        return golem;
-    }
-
-    public void setGolem(int golem) {
-        this.golem = golem;
-    }
-
-    public boolean[] getBoolVector() {
+    public long[] getBoolVector() {
         return boolVector;
     }
 
-    public void setBoolVector(boolean[] boolVector) {
+    public void setBoolVector(long[] boolVector) {
         this.boolVector = boolVector;
     }
 
@@ -76,45 +60,18 @@ public class SemanticVector implements Serializable, KryoSerializable {
 
         SemanticVector that = (SemanticVector) o;
 
-        return golem == that.golem && Arrays.equals(boolVector, that.boolVector) &&
+        return Arrays.equals(boolVector, that.boolVector) &&
                 Arrays.equals(mem, that.mem);
 
     }
 
     @Override
     public int hashCode() {
-        int result = golem;
+        int result = 0;
         result = 31 * result + Arrays.hashCode(boolVector);
         result = 31 * result + Arrays.hashCode(mem);
         return result;
     }
 
-    @Override
-    public void write(Kryo kryo, Output output) {
-        output.writeByte(golem);
-        byte[] bytes = BitUtils.convertToByteArray(boolVector);
-        for (byte each: bytes){
-            output.writeByte(each);
-        }
-        for (int each: mem){
-            output.writeInt(each);
-        }
-    }
 
-    @Override
-    public void read(Kryo kryo, Input input) {
-        golem = input.readByte();
-        boolVector = new boolean[Stem.RI_VECTOR_LENGTH];
-        final int bytesLen = Stem.RI_VECTOR_LENGTH / (Byte.SIZE - 1) +
-                ((Stem.RI_VECTOR_LENGTH % (Byte.SIZE - 1) > 0) ? 1 : 0) + 1;
-        byte[] bytes = new byte[bytesLen];
-        for (int i = 0, n = bytes.length; i < n; i++){
-            bytes[i] = input.readByte();
-        }
-        boolVector = BitUtils.convertToBits(bytes);
-        mem = new int[Stem.MEM_VECTOR_LENGTH];
-        for (int i = 0; i < Stem.MEM_VECTOR_LENGTH; i++){
-            mem[i] = input.readInt();
-        }
-    }
 }

@@ -3,6 +3,7 @@ package it.factbook.semantic;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.joda.JodaModule;
+import it.factbook.dictionary.Golem;
 import it.factbook.dictionary.Stem;
 import it.factbook.search.SearchProfile;
 import it.factbook.search.repository.FactKey;
@@ -20,10 +21,7 @@ import scala.Tuple2;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Properties;
+import java.util.*;
 import java.util.stream.Collectors;
 
 import static com.datastax.spark.connector.japi.CassandraJavaUtil.*;
@@ -54,19 +52,19 @@ public class SemanticSearch {
         conf.registerKryoClasses(new Class[]{IdiomKey.class, SemanticSearchMatch.class, SemanticVector.class,
                 SemanticSearchKeyComparator.class});
         JavaSparkContext sc = new JavaSparkContext(conf);
-        JavaRDD<SemanticVector> allVectors = javaFunctions(sc)
-                .cassandraTable(_keySpace, "idiom_v2")
-                .select("golem", "random_index", "mem")
-                .map(row -> new SemanticVector(
-                        row.getInt(0),
-                        BitUtils.reverseHash(row.getString(1), Stem.RI_VECTOR_LENGTH),
-                        jsonMapper.readValue(row.getString(2), new TypeReference<int[]>() {
-                        })))
-                .cache();
-        long count = allVectors.count();
-        log.debug("All vectors count {}", count);
+        Map<Integer, JavaRDD<SemanticVector>> allVectors = new HashMap<>(Golem.values().length-1);
+        for (int golemId: Golem.getValidKeys()) {
+            allVectors.put(golemId, javaFunctions(sc)
+                    .cassandraTable(_keySpace, "idiom_v2")
+                    .select("golem", "random_index", "mem")
+                    .map(row -> new Tuple2<>(row.getInt(0), new SemanticVector(row.getString(1), row.getString(2))))
+                    .filter(t -> t._1() == golemId)
+                    .map(Tuple2::_2)
+                    .persist(StorageLevel.MEMORY_ONLY_SER()));
+            long count = allVectors.get(golemId).count();
+            log.debug("All vectors for golem: {} -> count {}", golemId, count);
+        }
 
-        final int golemId = 1;
         try (ServerSocket serverSocket = new ServerSocket(_semanticSearchPort)) {
             while (true) {
                 try (Socket clientSocket = serverSocket.accept();
@@ -78,11 +76,20 @@ public class SemanticSearch {
                     if (inputLine != null) {
                         try {
                             SearchProfile profile = jsonMapper.readValue(inputLine, SearchProfile.class);
-                            List<IdiomKey> searchKeys = profile.getLines().stream()
-                                    .map(line -> new IdiomKey(line.getGolem().getId(), line.getRandomIndex(), line.getMem(), line.getWeight(), 0))
-                                    .collect(Collectors.toList());
-                            List<Match> matches = search(sc, allVectors, golemId, searchKeys);
-                            out.println(jsonMapper.writeValueAsString(matches));
+                            final int golemId = profile.getGolems().iterator().next().getId();
+                            if (golemId > 0) {
+                                if (profile.getGolems().size() > 1) {
+                                    log.warn("It is impossible in this version search by multiple golem profiles. " +
+                                            "Search using golem {}", golemId);
+                                }
+                                List<IdiomKey> searchKeys = profile.getLines().stream()
+                                        .map(line -> new IdiomKey(golemId, line.getRandomIndex(), line.getMem(), line.getWeight(), 0))
+                                        .collect(Collectors.toList());
+                                List<Match> matches = search(sc, allVectors.get(golemId), golemId, searchKeys);
+                                out.println(jsonMapper.writeValueAsString(matches));
+                            } else {
+                                log.error("Profile must have at least one line with valid golem.");
+                            }
                         } catch (IOException e) {
                             log.error("Error parse SearchProfile.class JSON: {}", e);
                         }
@@ -100,16 +107,16 @@ public class SemanticSearch {
 
     private static List<Match> search(JavaSparkContext sc, JavaRDD<SemanticVector> allVectors, int golemId, List<IdiomKey> searchKeys){
         JavaRDD<IdiomKey> foundVectorsRDD = allVectors
-                .filter(vector -> vector.getGolem() == golemId)
                 .flatMap(vector -> {
                     List<IdiomKey> foundVectors = new ArrayList<>();
                     for (IdiomKey searchKey : searchKeys) {
                         int commonMems = 0;
-                        if (BitUtils.getHammingDistance(vector.getBoolVector(), searchKey.boolVector) < MAX_HAMMING_DIST &&
+                        if (BitUtils.getHammingDistance(vector.getBoolVector(), searchKey.boolVectorAsLongs, 0, 1) < MAX_HAMMING_DIST &&
+                                BitUtils.getHammingDistance(vector.getBoolVector(), searchKey.boolVectorAsLongs, 1, searchKey.boolVectorAsLongs.length) < MAX_HAMMING_DIST &&
                                 (commonMems = commonMems(searchKey.mem, vector.getMem())) > MIN_COMMON_MEMS) {
                             foundVectors.add(new IdiomKey(
-                                    vector.getGolem(),
-                                    vector.getBoolVector(),
+                                    golemId,
+                                    BitUtils.convertToBits(vector.getBoolVector()),
                                     vector.getMem(),
                                     searchKey.weight,
                                     commonMems
@@ -120,17 +127,10 @@ public class SemanticSearch {
                 });
 
         List<IdiomKey> collapsedByRandomIndex = foundVectorsRDD
-                .mapToPair(vector -> new Tuple2<>(BitUtils.sparseVectorHash(vector.boolVector, false), vector))
-                .reduceByKey((a, b) -> new IdiomKey(a.golem, a.getBoolVector(), a.mem, a.weight + b.weight, a.commonMems))
+                .mapToPair(vector -> new Tuple2<>(vector.randomIndex, vector))
+                .reduceByKey((a, b) -> new IdiomKey(a.golem, a.randomIndex, a.mem, a.weight + b.weight, a.commonMems))
                 .map(Tuple2::_2)
-                .top(1000, new SemanticSearchKeyComparator())
-                .stream()
-                .map(key -> {
-                    IdiomKey keyWithHash = new IdiomKey(key);
-                    keyWithHash.setRandomIndex(BitUtils.sparseVectorHash(key.boolVector, false));
-                    return keyWithHash;
-                })
-                .collect(Collectors.toList());
+                .top(1000, new SemanticSearchKeyComparator());
 
         JavaPairRDD<IdiomKey,SemanticSearchMatch> matchesRDD = javaFunctions(sc.parallelize(collapsedByRandomIndex))
                 .joinWithCassandraTable(_keySpace, "semantic_index_v2",
@@ -236,7 +236,7 @@ public class SemanticSearch {
 
     public static class IdiomKey implements Serializable{
         private int golem;
-        private boolean[] boolVector;
+        private long[] boolVectorAsLongs;
         private String randomIndex;
         private int[] mem;
         private int weight;
@@ -244,7 +244,17 @@ public class SemanticSearch {
 
         public IdiomKey(int golem, boolean[] boolVector, int[] mem, int weight, int commonMems) {
             this.golem = golem;
-            this.boolVector = boolVector;
+            this.boolVectorAsLongs = BitUtils.convertToLongArray(boolVector);
+            this.randomIndex = BitUtils.sparseVectorHash(boolVector, false);
+            this.mem = mem;
+            this.weight = weight;
+            this.commonMems = commonMems;
+        }
+
+        public IdiomKey(int golem, String randomIndex, int[] mem, int weight, int commonMems) {
+            this.golem = golem;
+            this.boolVectorAsLongs = BitUtils.convertToLongArray(BitUtils.reverseHash(randomIndex, Stem.RI_VECTOR_LENGTH));
+            this.randomIndex = randomIndex;
             this.mem = mem;
             this.weight = weight;
             this.commonMems = commonMems;
@@ -252,7 +262,8 @@ public class SemanticSearch {
 
         public IdiomKey(IdiomKey src){
             this.golem = src.golem;
-            this.boolVector = src.boolVector;
+            this.boolVectorAsLongs = src.boolVectorAsLongs;
+            this.randomIndex = src.randomIndex;
             this.mem = src.mem;
             this.weight = src.weight;
             this.commonMems = src.commonMems;
@@ -264,14 +275,6 @@ public class SemanticSearch {
 
         public void setGolem(int golem) {
             this.golem = golem;
-        }
-
-        public boolean[] getBoolVector() {
-            return boolVector;
-        }
-
-        public void setBoolVector(boolean[] boolVector) {
-            this.boolVector = boolVector;
         }
 
         public int[] getMem() {
@@ -304,6 +307,14 @@ public class SemanticSearch {
 
         public void setRandomIndex(String randomIndex) {
             this.randomIndex = randomIndex;
+        }
+
+        public long[] getBoolVectorAsLongs() {
+            return boolVectorAsLongs;
+        }
+
+        public void setBoolVectorAsLongs(long[] boolVectorAsLongs) {
+            this.boolVectorAsLongs = boolVectorAsLongs;
         }
     }
 
