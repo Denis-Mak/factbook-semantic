@@ -1,12 +1,12 @@
 package it.factbook.semantic;
 
-import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.joda.JodaModule;
 import it.factbook.dictionary.Golem;
-import it.factbook.dictionary.Stem;
 import it.factbook.search.SearchProfile;
 import it.factbook.search.repository.FactKey;
+import it.factbook.search.repository.Idiom;
 import it.factbook.search.repository.Match;
 import it.factbook.util.BitUtils;
 import org.apache.spark.SparkConf;
@@ -49,7 +49,7 @@ public class SemanticSearch {
         conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer");
         _keySpace = config.getProperty("cassandra.keyspace");
         //conf.set("spark.kryo.registrationRequired", "true");
-        conf.registerKryoClasses(new Class[]{IdiomKey.class, SemanticSearchMatch.class, SemanticVector.class,
+        conf.registerKryoClasses(new Class[]{SemanticKey.class, SemanticSearchMatch.class, SemanticVector.class,
                 SemanticSearchKeyComparator.class});
         JavaSparkContext sc = new JavaSparkContext(conf);
         Map<Integer, JavaRDD<SemanticVector>> allVectors = new HashMap<>(Golem.values().length-1);
@@ -71,22 +71,29 @@ public class SemanticSearch {
                      PrintWriter out =
                              new PrintWriter(clientSocket.getOutputStream(), true);
                      BufferedReader in = new BufferedReader(
-                             new InputStreamReader(clientSocket.getInputStream()));) {
+                             new InputStreamReader(clientSocket.getInputStream()))) {
                     String inputLine = in.readLine();
                     if (inputLine != null) {
                         try {
-                            SearchProfile profile = jsonMapper.readValue(inputLine, SearchProfile.class);
+                            JsonNode root = jsonMapper.readTree(inputLine);
+                            int action = root.get("actionCode").asInt();
+                            SearchProfile profile = jsonMapper.treeToValue(root.get("profile"), SearchProfile.class);
                             final int golemId = profile.getGolems().iterator().next().getId();
                             if (golemId > 0) {
                                 if (profile.getGolems().size() > 1) {
                                     log.warn("It is impossible in this version search by multiple golem profiles. " +
                                             "Search using golem {}", golemId);
                                 }
-                                List<IdiomKey> searchKeys = profile.getLines().stream()
-                                        .map(line -> new IdiomKey(golemId, line.getRandomIndex(), line.getMem(), line.getWeight(), 0))
+                                List<SemanticKey> searchKeys = profile.getLines().stream()
+                                        .map(line -> new SemanticKey(golemId, line.getRandomIndex(), line.getMem(), line.getWeight(), 0))
                                         .collect(Collectors.toList());
-                                List<Match> matches = search(sc, allVectors.get(golemId), golemId, searchKeys);
-                                out.println(jsonMapper.writeValueAsString(matches));
+                                if (action == 1) {
+                                    List<Match> matches = search(sc, allVectors.get(golemId), searchKeys);
+                                    out.println(jsonMapper.writeValueAsString(matches));
+                                } else {
+                                    List<Idiom> idioms = getSimilarIdioms(sc, allVectors.get(golemId), searchKeys);
+                                    out.println(jsonMapper.writeValueAsString(idioms));
+                                }
                             } else {
                                 log.error("Profile must have at least one line with valid golem.");
                             }
@@ -105,44 +112,21 @@ public class SemanticSearch {
         }
     }
 
-    private static List<Match> search(JavaSparkContext sc, JavaRDD<SemanticVector> allVectors, int golemId, List<IdiomKey> searchKeys){
-        JavaRDD<IdiomKey> foundVectorsRDD = allVectors
-                .flatMap(vector -> {
-                    List<IdiomKey> foundVectors = new ArrayList<>();
-                    for (IdiomKey searchKey : searchKeys) {
-                        int commonMems = 0;
-                        if (BitUtils.getHammingDistance(vector.getBoolVector(), searchKey.boolVectorAsLongs, 0, 1) < MAX_HAMMING_DIST &&
-                                BitUtils.getHammingDistance(vector.getBoolVector(), searchKey.boolVectorAsLongs, 1, searchKey.boolVectorAsLongs.length) < MAX_HAMMING_DIST &&
-                                (commonMems = commonMems(searchKey.mem, vector.getMem())) > MIN_COMMON_MEMS) {
-                            foundVectors.add(new IdiomKey(
-                                    golemId,
-                                    BitUtils.convertToBits(vector.getBoolVector()),
-                                    vector.getMem(),
-                                    searchKey.weight,
-                                    commonMems
-                            ));
-                        }
-                    }
-                    return foundVectors;
-                });
+    private static List<Match> search(JavaSparkContext sc, JavaRDD<SemanticVector> allVectors, List<SemanticKey> searchKeys){
+        List<SemanticKey> collapsedByRandomIndex = getSimilarIdiomKeys(allVectors, searchKeys);
 
-        List<IdiomKey> collapsedByRandomIndex = foundVectorsRDD
-                .mapToPair(vector -> new Tuple2<>(vector.randomIndex, vector))
-                .reduceByKey((a, b) -> new IdiomKey(a.golem, a.randomIndex, a.mem, a.weight + b.weight, a.commonMems))
-                .map(Tuple2::_2)
-                .top(1000, new SemanticSearchKeyComparator());
-
-        JavaPairRDD<IdiomKey,SemanticSearchMatch> matchesRDD = javaFunctions(sc.parallelize(collapsedByRandomIndex))
+        JavaPairRDD<SemanticKey,SemanticSearchMatch> matchesRDD = javaFunctions(sc.parallelize(collapsedByRandomIndex))
                 .joinWithCassandraTable(_keySpace, "semantic_index_v2",
                         someColumns("golem", "url", "pos", "factuality", "fingerprint"),
                         someColumns("golem", "random_index"),
                         mapRowTo(SemanticSearchMatch.class),
-                        mapToRow(IdiomKey.class));
+                        mapToRow(SemanticKey.class));
 
-        JavaPairRDD<FactKey, Match> groupedByFactKey = matchesRDD
+        List<Tuple2<SemanticKey, SemanticSearchMatch>> matches = matchesRDD.collect();
+        return matches.stream()
                 .map(m -> {
                     int factuality = m._2().factuality;
-                    int relevancy = new Long(Math.round(Math.log(1 + factuality) * m._1().weight * m._1().commonMems)).intValue();
+                    int relevancy = new Long(Math.round(Math.log(1 + factuality) * m._1().getWeight() * m._1().getCommonMems())).intValue();
                     Match match = new Match(0, relevancy);
                     match.attrs.put("url", m._2().url);
                     match.attrs.put("pos", m._2().pos);
@@ -151,19 +135,56 @@ public class SemanticSearch {
                     match.attrs.put("fingerprint", m._2().fingerprint);
                     return match;
                 })
-                .keyBy(m -> new FactKey((String)m.attrs.get("url"), (int)m.attrs.get("pos")))
-                .reduceByKey((m1, m2) -> {
-                    m1.relevance = m1.relevance + m2.relevance;
-                    return m1;
-                });
-
-        return groupedByFactKey.map(Tuple2::_2).collect();
+                .sorted((m1, m2) -> Integer.compare(m2.relevance, m1.relevance))
+                .limit(1000)
+                .collect(Collectors.toList());
     }
 
-    public static class SemanticSearchKeyComparator implements Comparator<IdiomKey>, Serializable {
+    private static List<Idiom> getSimilarIdioms(JavaSparkContext sc, JavaRDD<SemanticVector> allVectors, List<SemanticKey> searchKeys){
+        List<SemanticKey> keysToIdioms = getSimilarIdiomKeys(allVectors, searchKeys);
+
+        JavaPairRDD<SemanticKey,Idiom> idioms = javaFunctions(sc.parallelize(keysToIdioms))
+                .joinWithCassandraTable(_keySpace, "idiom_v2",
+                        someColumns("golem","random_index", "mem", "idiom"),
+                        someColumns("golem", "random_index"),
+                        mapRowTo(Idiom.class),
+                        mapToRow(SemanticKey.class));
+        return idioms.map(Tuple2::_2).collect();
+    }
+
+    private static List<SemanticKey> getSimilarIdiomKeys(JavaRDD<SemanticVector> allVectors, List<SemanticKey> searchKeys){
+        JavaRDD<SemanticKey> foundVectorsRDD = allVectors
+                .flatMap(vector -> {
+                    List<SemanticKey> foundVectors = new ArrayList<>();
+                    for (SemanticKey searchKey : searchKeys) {
+                        int commonMems = 0;
+                        if (BitUtils.getHammingDistance(vector.getBoolVector(), searchKey.getBoolVectorAsLongs(), 0, 1) < MAX_HAMMING_DIST &&
+                                BitUtils.getHammingDistance(vector.getBoolVector(), searchKey.getBoolVectorAsLongs(), 1, searchKey.getBoolVectorAsLongs().length) < MAX_HAMMING_DIST &&
+                                (commonMems = commonMems(searchKey.getMem(), vector.getMem())) > MIN_COMMON_MEMS) {
+                            foundVectors.add(new SemanticKey(
+                                    searchKey.getGolem(),
+                                    BitUtils.convertToBits(vector.getBoolVector()),
+                                    vector.getMem(),
+                                    searchKey.getWeight(),
+                                    commonMems
+                            ));
+                        }
+                    }
+                    return foundVectors;
+                });
+
+        return foundVectorsRDD
+                .mapToPair(vector -> new Tuple2<>(vector.getRandomIndex(), vector))
+                .reduceByKey((a, b) ->
+                        new SemanticKey(a.getGolem(), a.getRandomIndex(), a.getMem(), a.getWeight() + b.getWeight(), a.getCommonMems()))
+                .map(Tuple2::_2)
+                .top(1000, new SemanticSearchKeyComparator());
+    }
+
+    public static class SemanticSearchKeyComparator implements Comparator<SemanticKey>, Serializable {
         @Override
-        public int compare(IdiomKey a, IdiomKey b) {
-            return (a.weight < b.weight) ? -1 : ((a.weight == b.weight) ? 0 : 1);
+        public int compare(SemanticKey a, SemanticKey b) {
+            return (a.getWeight() < b.getWeight()) ? -1 : ((a.getWeight() == b.getWeight()) ? 0 : 1);
         }
     }
 
@@ -231,90 +252,6 @@ public class SemanticSearch {
 
         public void setFactuality(int factuality) {
             this.factuality = factuality;
-        }
-    }
-
-    public static class IdiomKey implements Serializable{
-        private int golem;
-        private long[] boolVectorAsLongs;
-        private String randomIndex;
-        private int[] mem;
-        private int weight;
-        private int commonMems;
-
-        public IdiomKey(int golem, boolean[] boolVector, int[] mem, int weight, int commonMems) {
-            this.golem = golem;
-            this.boolVectorAsLongs = BitUtils.convertToLongArray(boolVector);
-            this.randomIndex = BitUtils.sparseVectorHash(boolVector, false);
-            this.mem = mem;
-            this.weight = weight;
-            this.commonMems = commonMems;
-        }
-
-        public IdiomKey(int golem, String randomIndex, int[] mem, int weight, int commonMems) {
-            this.golem = golem;
-            this.boolVectorAsLongs = BitUtils.convertToLongArray(BitUtils.reverseHash(randomIndex, Stem.RI_VECTOR_LENGTH));
-            this.randomIndex = randomIndex;
-            this.mem = mem;
-            this.weight = weight;
-            this.commonMems = commonMems;
-        }
-
-        public IdiomKey(IdiomKey src){
-            this.golem = src.golem;
-            this.boolVectorAsLongs = src.boolVectorAsLongs;
-            this.randomIndex = src.randomIndex;
-            this.mem = src.mem;
-            this.weight = src.weight;
-            this.commonMems = src.commonMems;
-        }
-
-        public int getGolem() {
-            return golem;
-        }
-
-        public void setGolem(int golem) {
-            this.golem = golem;
-        }
-
-        public int[] getMem() {
-            return mem;
-        }
-
-        public void setMem(int[] mem) {
-            this.mem = mem;
-        }
-
-        public int getWeight() {
-            return weight;
-        }
-
-        public void setWeight(int weight) {
-            this.weight = weight;
-        }
-
-        public int getCommonMems() {
-            return commonMems;
-        }
-
-        public void setCommonMems(int commonMems) {
-            this.commonMems = commonMems;
-        }
-
-        public String getRandomIndex() {
-            return randomIndex;
-        }
-
-        public void setRandomIndex(String randomIndex) {
-            this.randomIndex = randomIndex;
-        }
-
-        public long[] getBoolVectorAsLongs() {
-            return boolVectorAsLongs;
-        }
-
-        public void setBoolVectorAsLongs(long[] boolVectorAsLongs) {
-            this.boolVectorAsLongs = boolVectorAsLongs;
         }
     }
 
