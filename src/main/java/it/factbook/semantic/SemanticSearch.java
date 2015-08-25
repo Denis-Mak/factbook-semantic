@@ -1,9 +1,21 @@
 package it.factbook.semantic;
 
+import com.datastax.spark.connector.ColumnSelector;
+import com.datastax.spark.connector.cql.CassandraConnector;
+import com.datastax.spark.connector.japi.RDDJavaFunctions;
+import com.datastax.spark.connector.japi.rdd.CassandraJavaPairRDD;
+import com.datastax.spark.connector.rdd.CassandraJoinRDD;
+import com.datastax.spark.connector.rdd.ClusteringOrder;
+import com.datastax.spark.connector.rdd.CqlWhereClause;
+import com.datastax.spark.connector.rdd.ReadConf;
+import com.datastax.spark.connector.rdd.reader.RowReaderFactory;
+import com.datastax.spark.connector.util.JavaApiHelper;
+import com.datastax.spark.connector.writer.RowWriterFactory;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.joda.JodaModule;
 import it.factbook.dictionary.Golem;
+import it.factbook.dictionary.Stem;
 import it.factbook.search.SearchProfile;
 import it.factbook.search.repository.FactKey;
 import it.factbook.search.repository.Idiom;
@@ -13,10 +25,13 @@ import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.rdd.RDD;
 import org.apache.spark.storage.StorageLevel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import scala.Option;
 import scala.Tuple2;
+import scala.reflect.ClassTag;
 
 import java.io.*;
 import java.net.ServerSocket;
@@ -47,6 +62,7 @@ public class SemanticSearch {
         conf.set("spark.cassandra.auth.password", config.getProperty("cassandra.password"));
         int _semanticSearchPort = Integer.parseInt(config.getProperty("semantic.search.port"));
         conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer");
+        conf.set("spark.kryoserializer.buffer.max.mb", "512");
         _keySpace = config.getProperty("cassandra.keyspace");
         //conf.set("spark.kryo.registrationRequired", "true");
         conf.registerKryoClasses(new Class[]{SemanticKey.class, SemanticSearchMatch.class, SemanticVector.class,
@@ -85,8 +101,18 @@ public class SemanticSearch {
                                             "Search using golem {}", golemId);
                                 }
                                 List<SemanticKey> searchKeys = profile.getLines().stream()
+                                        .filter(line -> line.getMem().length > 0 &&
+                                                line.getRandomIndex().length > 0)
                                         .map(line -> new SemanticKey(golemId, line.getRandomIndex(), line.getMem(), line.getWeight(), 0))
                                         .collect(Collectors.toList());
+                                if (searchKeys.isEmpty()){
+                                    continue;
+                                }
+                                searchKeys.stream()
+                                        .forEach(e ->
+                                                log.debug("Line to search, random vector: {}, mem: {}",
+                                                        e.getRandomIndex(),
+                                                        Arrays.toString(e.getMem())));
                                 if (action == 1) {
                                     List<Match> matches = search(sc, allVectors.get(golemId), searchKeys);
                                     out.println(jsonMapper.writeValueAsString(matches));
@@ -115,9 +141,9 @@ public class SemanticSearch {
     private static List<Match> search(JavaSparkContext sc, JavaRDD<SemanticVector> allVectors, List<SemanticKey> searchKeys){
         List<SemanticKey> collapsedByRandomIndex = getSimilarIdiomKeys(allVectors, searchKeys);
 
-        JavaPairRDD<SemanticKey,SemanticSearchMatch> matchesRDD = javaFunctions(sc.parallelize(collapsedByRandomIndex))
+        JavaPairRDD<SemanticKey,SemanticSearchMatch> matchesRDD = customJavaFunctions(sc.parallelize(collapsedByRandomIndex))
                 .joinWithCassandraTable(_keySpace, "semantic_index_v2",
-                        someColumns("golem", "url", "pos", "factuality", "fingerprint"),
+                        someColumns("golem", "url", "pos", "factuality", "fingerprint", "idiom"),
                         someColumns("golem", "random_index"),
                         mapRowTo(SemanticSearchMatch.class),
                         mapToRow(SemanticKey.class));
@@ -133,6 +159,7 @@ public class SemanticSearch {
                     match.attrs.put("golem", m._2().golem);
                     match.attrs.put("factuality", factuality);
                     match.attrs.put("fingerprint", m._2().fingerprint);
+                    match.attrs.put("idiom", m._2().idiom);
                     return match;
                 })
                 .sorted((m1, m2) -> Integer.compare(m2.relevance, m1.relevance))
@@ -145,11 +172,16 @@ public class SemanticSearch {
 
         JavaPairRDD<SemanticKey,Idiom> idioms = javaFunctions(sc.parallelize(keysToIdioms))
                 .joinWithCassandraTable(_keySpace, "idiom_v2",
-                        someColumns("golem","random_index", "mem", "idiom"),
+                        someColumns("golem", "random_index", "mem", "idiom"),
                         someColumns("golem", "random_index"),
                         mapRowTo(Idiom.class),
                         mapToRow(SemanticKey.class));
-        return idioms.map(Tuple2::_2).collect();
+        return idioms
+                .sortByKey(new SemanticSearchKeyComparator())
+                .map(pair -> {
+                    pair._2().setWeight(pair._1().getWeight());
+                    return pair._2();
+                }).collect();
     }
 
     private static List<SemanticKey> getSimilarIdiomKeys(JavaRDD<SemanticVector> allVectors, List<SemanticKey> searchKeys){
@@ -184,7 +216,8 @@ public class SemanticSearch {
     public static class SemanticSearchKeyComparator implements Comparator<SemanticKey>, Serializable {
         @Override
         public int compare(SemanticKey a, SemanticKey b) {
-            return (a.getWeight() < b.getWeight()) ? -1 : ((a.getWeight() == b.getWeight()) ? 0 : 1);
+            // for DESC ordering comparator inverted
+            return (b.getWeight() < a.getWeight()) ? -1 : ((a.getWeight() == b.getWeight()) ? 0 : 1);
         }
     }
 
@@ -207,6 +240,7 @@ public class SemanticSearch {
         private int pos;
         private int fingerprint;
         private int factuality;
+        private String idiom;
 
         public SemanticSearchMatch(int golem, String url, int pos) {
             this.golem = golem;
@@ -253,6 +287,60 @@ public class SemanticSearch {
         public void setFactuality(int factuality) {
             this.factuality = factuality;
         }
+
+        public String getIdiom() {
+            return idiom;
+        }
+
+        public void setIdiom(String idiom) {
+            this.idiom = idiom;
+        }
     }
 
+    static class CustomRDDJavaFunctions<T> extends RDDJavaFunctions<T> {
+        public CustomRDDJavaFunctions(RDD<T> rdd) {
+            super(rdd);
+        }
+
+        @Override
+        public <R> CassandraJavaPairRDD<T, R> joinWithCassandraTable(
+                String keyspaceName,
+                String tableName,
+                ColumnSelector selectedColumns,
+                ColumnSelector joinColumns,
+                RowReaderFactory<R> rowReaderFactory,
+                RowWriterFactory<T> rowWriterFactory
+        ) {
+            ClassTag<T> classTagT = rdd.toJavaRDD().classTag();
+            ClassTag<R> classTagR = JavaApiHelper.getClassTag(rowReaderFactory.targetClass());
+
+            CassandraConnector connector = defaultConnector();
+            Option<ClusteringOrder> clusteringOrder = Option.empty();
+            Option<Object> limit = Option.apply(1000L);
+            CqlWhereClause whereClause = CqlWhereClause.empty();
+            ReadConf readConf = ReadConf.fromSparkConf(rdd.conf());
+
+            CassandraJoinRDD<T, R> joinRDD = new CassandraJoinRDD<>(
+                    rdd,
+                    keyspaceName,
+                    tableName,
+                    connector,
+                    selectedColumns,
+                    joinColumns,
+                    whereClause,
+                    limit,
+                    clusteringOrder,
+                    readConf,
+                    classTagT,
+                    classTagR,
+                    rowWriterFactory,
+                    rowReaderFactory);
+
+            return new CassandraJavaPairRDD<>(joinRDD, classTagT, classTagR);
+        }
+    }
+
+    private static <T> RDDJavaFunctions<T> customJavaFunctions(JavaRDD<T> rdd) {
+        return new CustomRDDJavaFunctions<>(rdd.rdd());
+    }
 }
