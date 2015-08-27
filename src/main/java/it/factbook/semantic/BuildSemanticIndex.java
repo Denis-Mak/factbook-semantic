@@ -17,17 +17,17 @@ import it.factbook.util.TextSplitterOpenNlpRuImpl;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Properties;
-import java.util.StringJoiner;
+import java.util.*;
 
 import static com.datastax.spark.connector.japi.CassandraJavaUtil.javaFunctions;
 import static com.datastax.spark.connector.japi.CassandraJavaUtil.mapToRow;
 
 public class BuildSemanticIndex {
     private static final ObjectMapper jsonMapper = new ObjectMapper();
+    private static final Logger log = LoggerFactory.getLogger(BuildSemanticIndex.class);
     private static final class FactProcessorWrapper{
         private static FactProcessor factProcessor;
         static {
@@ -53,12 +53,15 @@ public class BuildSemanticIndex {
         SparkConf conf = new SparkConf();
         conf.setAppName("Build Semantic Index");
         conf.setMaster(config.getProperty("spark.master"));
-        conf.set("spark.executor.memory", config.getProperty("spark.executor.memory"));
+        conf.set("spark.executor.memory", "9G");
+        conf.set("spark.driver.memory", "9G");
         conf.set("spark.cassandra.connection.host", config.getProperty("cassandra.host"));
         conf.set("spark.cassandra.auth.username", config.getProperty("cassandra.user"));
         conf.set("spark.cassandra.auth.password", config.getProperty("cassandra.password"));
+        //conf.set("spark.cassandra.input.split.size_in_mb", "10");
         conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer");
         conf.set("spark.kryo.registrationRequired", "true");
+        conf.set("spark.kryoserializer.buffer.max", "512M");
         //conf.set("spark.executor.extraJavaOptions", "-verbose:gc -XX:+PrintGCDetails -XX:+PrintGCTimeStamps");
         conf.registerKryoClasses(new Class[]{Fact.class, FactProcessor.class,
                 ClassifierAdapterImpl.class, SemanticIndexRow.class, WordFormAdapterInMemoryImpl.class,
@@ -74,41 +77,52 @@ public class BuildSemanticIndex {
                 .select("url", "pos", "golem", "proto", "content", "fingerprint", "factuality")
                 .map(row -> {
                     String url = row.getString("proto") + "://" + row.getString("url");
-                    return new Fact.Builder()
-                            .content(row.getString("content"))
-                            .url(url)
-                            .factuality(row.getInt("factuality"))
-                            .fingerprint(BitUtils.convertToBits(row.getInt("fingerprint")))
-                            .golem(Golem.valueOf(row.getInt("golem")))
-                            .pos(row.getInt("pos"))
-                            .build();
+                    int pos = row.getInt("pos");
+                    try {
+                        return new Fact.Builder()
+                                .content(row.getString("content"))
+                                .url(url)
+                                .factuality(row.getInt("factuality"))
+                                .fingerprint(BitUtils.convertToBits(row.getInt("fingerprint")))
+                                .golem(Golem.valueOf(row.getInt("golem")))
+                                .pos(pos)
+                                .build();
+                    } catch (Exception e) {
+                        log.error("Error read fact URL:{} pos:{} \n {}", url, pos, e);
+                    }
+                    return new Fact.Builder().build();
                 });
 
         JavaRDD<SemanticIndexRow> idiomsInFacts = facts
                 .flatMap(f -> {
-                    FactProcessor factProcessor = FactProcessorWrapper.getFactProcessor();
-                    List<WordForm[]> factIdioms = factProcessor.getIdioms(
-                            factProcessor.getTrees(f.getGolem(), f.getContent()));
-                    List<int[]> sense = factProcessor.convertToSense(factIdioms);
-                    StemAdapter stemAdapter = factProcessor.getStemAdapter();
-                    List<SemanticIndexRow> rows = new ArrayList<>(factIdioms.size());
-                    for (int i = 0; i < factIdioms.size(); i++) {
-                        StringJoiner sj = new StringJoiner(", ");
-                        for (WordForm wf : factIdioms.get(i)) {
-                            sj.add(wf.getWord());
+                    try {
+                        FactProcessor factProcessor = FactProcessorWrapper.getFactProcessor();
+                        List<WordForm[]> factIdioms = factProcessor.getIdioms(
+                                factProcessor.getTrees(f.getGolem(), f.getContent()));
+                        List<int[]> sense = factProcessor.convertToSense(factIdioms);
+                        StemAdapter stemAdapter = factProcessor.getStemAdapter();
+                        List<SemanticIndexRow> rows = new ArrayList<>(factIdioms.size());
+                        for (int i = 0; i < factIdioms.size(); i++) {
+                            StringJoiner sj = new StringJoiner(", ");
+                            for (WordForm wf : factIdioms.get(i)) {
+                                sj.add(wf.getWord());
+                            }
+                            SemanticIndexRow semanticIndexRow = new SemanticIndexRow();
+                            semanticIndexRow.setGolem(f.getGolem().getId()) ;
+                            semanticIndexRow.setRandomIndex(BitUtils.sparseVectorHash(stemAdapter.getRandomIndexingVector(f.getGolem(), sense.get(i)), false));
+                            semanticIndexRow.setMem(jsonMapper.writeValueAsString(sense.get(i)));
+                            semanticIndexRow.setUrl(f.getUrlObj().getHost() + f.getUrlObj().getFile());
+                            semanticIndexRow.setPos(f.getPos());
+                            semanticIndexRow.setFactuality(f.getFactuality());
+                            semanticIndexRow.setFingerprint(f.getFingerprintAsInt());
+                            semanticIndexRow.setIdiom(sj.toString());
+                            rows.add(semanticIndexRow);
                         }
-                        SemanticIndexRow semanticIndexRow = new SemanticIndexRow();
-                        semanticIndexRow.setGolem(f.getGolem().getId()) ;
-                        semanticIndexRow.setRandomIndex(BitUtils.sparseVectorHash(stemAdapter.getRandomIndexingVector(f.getGolem(), sense.get(i)), false));
-                        semanticIndexRow.setMem(jsonMapper.writeValueAsString(sense.get(i)));
-                        semanticIndexRow.setUrl(f.getUrlObj().getHost() + f.getUrlObj().getFile());
-                        semanticIndexRow.setPos(f.getPos());
-                        semanticIndexRow.setFactuality(f.getFactuality());
-                        semanticIndexRow.setFingerprint(f.getFingerprintAsInt());
-                        semanticIndexRow.setIdiom(sj.toString());
-                        rows.add(semanticIndexRow);
+                        return rows;
+                    } catch (Exception e) {
+                        log.error("Error during parsing fact URL:{} pos: {}\n Stacktrace {} ", f.getUrl(), f.getPos(), e);
                     }
-                    return rows;
+                    return Collections.<SemanticIndexRow>emptyList();
                 });
 
         javaFunctions(idiomsInFacts)

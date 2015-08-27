@@ -31,6 +31,9 @@ public class BuildIdiomIndex {
         conf.set("spark.cassandra.auth.password", config.getProperty("cassandra.password"));
         conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer");
         conf.set("spark.kryo.registrationRequired", "true");
+        conf.set("spark.kryoserializer.buffer.max", "512M");
+        conf.set("spark.executor.memory", "4G");
+        conf.set("spark.cassandra.input.split.size_in_mb", "10");
         conf.registerKryoClasses(new Class[]{SemanticIndexRow.class});
         String _keySpace = config.getProperty("cassandra.keyspace");
         JavaSparkContext sc = new JavaSparkContext(conf);
