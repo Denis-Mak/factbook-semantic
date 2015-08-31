@@ -64,7 +64,7 @@ public class SemanticSearch {
         _keySpace = config.getProperty("cassandra.keyspace");
         //conf.set("spark.kryo.registrationRequired", "true");
         conf.registerKryoClasses(new Class[]{SemanticKey.class, SemanticSearchMatch.class, SemanticVector.class,
-                SemanticSearchKeyComparator.class});
+                SemanticKeyMemsComparator.class});
         JavaSparkContext sc = new JavaSparkContext(conf);
         Map<Integer, JavaRDD<SemanticVector>> allVectors = new HashMap<>(Golem.values().length-1);
         for (int golemId: Golem.getValidKeys()) {
@@ -138,7 +138,6 @@ public class SemanticSearch {
     }
 
     private static List<Match> search(JavaRDD<SemanticVector> allVectors, List<SemanticKey> searchKeys){
-        List<SemanticKey> keys = getSimilarIdiomKeys(allVectors, searchKeys).collect();
         JavaPairRDD<SemanticKey,SemanticSearchMatch> matchesRDD = customJavaFunctions(getSimilarIdiomKeys(allVectors, searchKeys))
                 .joinWithCassandraTable(_keySpace, "semantic_index_v2",
                         someColumns("golem", "url", "pos", "factuality", "fingerprint", "idiom"),
@@ -173,7 +172,7 @@ public class SemanticSearch {
                         mapRowTo(Idiom.class),
                         mapToRow(SemanticKey.class));
         return idioms
-                .sortByKey(new SemanticSearchKeyComparator())
+                .sortByKey(new SemanticKeyMemsComparator())
                 .map(pair -> {
                     pair._2().setWeight(pair._1().getCommonMems());
                     return pair._2();
@@ -202,11 +201,11 @@ public class SemanticSearch {
                 });
     }
 
-    public static class SemanticSearchKeyComparator implements Comparator<SemanticKey>, Serializable {
+    public static class SemanticKeyMemsComparator implements Comparator<SemanticKey>, Serializable {
         @Override
         public int compare(SemanticKey a, SemanticKey b) {
             // for DESC ordering comparator inverted
-            return (b.getWeight() < a.getWeight()) ? -1 : ((a.getWeight() == b.getWeight()) ? 0 : 1);
+            return (b.getCommonMems() < a.getCommonMems()) ? -1 : ((a.getCommonMems() == b.getCommonMems()) ? 0 : 1);
         }
     }
 
