@@ -62,11 +62,12 @@ public class SemanticSearch {
         conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer");
         conf.set("spark.kryoserializer.buffer.max.mb", "512");
         _keySpace = config.getProperty("cassandra.keyspace");
+        conf.set("spark.cassandra.input.split.size_in_mb", "256");
         //conf.set("spark.kryo.registrationRequired", "true");
         conf.registerKryoClasses(new Class[]{SemanticKey.class, SemanticSearchMatch.class, SemanticVector.class,
                 SemanticKeyMemsComparator.class});
         JavaSparkContext sc = new JavaSparkContext(conf);
-        Map<Integer, JavaRDD<SemanticVector>> allVectors = new HashMap<>(Golem.values().length-1);
+        Map<Integer, JavaRDD<SemanticVector>> allVectors = new HashMap<>(Golem.values().length - 1);
         for (int golemId: Golem.getValidKeys()) {
             allVectors.put(golemId, javaFunctions(sc)
                     .cassandraTable(_keySpace, "idiom_v2")
@@ -134,6 +135,10 @@ public class SemanticSearch {
         } catch (IOException e) {
             log.error("Exception caught when trying to listen on port "
                     + " or listening for a connection \n {}", e);
+        } finally {
+            log.info("Shutdown spark context");
+            sc.stop();
+            sc.close();
         }
     }
 
@@ -144,9 +149,7 @@ public class SemanticSearch {
                         someColumns("golem", "random_index", "mem"),
                         mapRowTo(SemanticSearchMatch.class),
                         mapToRow(SemanticKey.class));
-
-        List<Tuple2<SemanticKey, SemanticSearchMatch>> matches = matchesRDD.collect();
-        return matches.stream()
+        return matchesRDD.collect().stream()
                 .map(m -> {
                     int factuality = m._2().factuality;
                     int relevancy = new Long(Math.round(Math.log(1 + factuality) * m._1().getWeight() * m._1().getCommonMems())).intValue();
@@ -159,8 +162,6 @@ public class SemanticSearch {
                     match.attrs.put("idiom", m._2().idiom);
                     return match;
                 })
-                .sorted((m1, m2) -> Integer.compare(m2.relevance, m1.relevance))
-                .limit(1000)
                 .collect(Collectors.toList());
     }
 
@@ -179,26 +180,47 @@ public class SemanticSearch {
                 }).collect();
     }
 
-    private static JavaRDD<SemanticKey> getSimilarIdiomKeys(JavaRDD<SemanticVector> allVectors, List<SemanticKey> searchKeys){
+    private static JavaRDD<SemanticKey> getSimilarIdiomKeys(JavaRDD<SemanticVector> allVectors,
+                                                            List<SemanticKey> searchKeys){
         return allVectors
-                .flatMap(vector -> {
-                    List<SemanticKey> foundVectors = new ArrayList<>();
+                .flatMapToPair(vector -> {
+                    List<Tuple2<String, SemanticKey>> allKeysFound = new ArrayList<>();
                     for (SemanticKey searchKey : searchKeys) {
-                        int commonMems = 0;
-                        if (BitUtils.getHammingDistance(vector.getBoolVector(), searchKey.getBoolVectorAsLongs(), 0, 1) < MAX_HAMMING_DIST &&
-                                BitUtils.getHammingDistance(vector.getBoolVector(), searchKey.getBoolVectorAsLongs(), 1, searchKey.getBoolVectorAsLongs().length) < MAX_HAMMING_DIST &&
-                                (commonMems = commonMems(searchKey.getMemIntArr(), vector.getMem())) > MIN_COMMON_MEMS) {
-                            foundVectors.add(new SemanticKey(
-                                    searchKey.getGolem(),
-                                    BitUtils.convertToBits(vector.getBoolVector()),
-                                    vector.getMem(),
-                                    searchKey.getWeight(),
-                                    commonMems
-                            ));
+                        int commonMems;
+                        if (checkDistance(vector.getBoolVector(), searchKey.getBoolVectorAsLongs()) &&
+                                (commonMems = commonMems(vector.getMem(), searchKey.getMemIntArr())) > MIN_COMMON_MEMS) {
+                            allKeysFound.add(
+                                    new Tuple2<>(searchKey.getMem(),
+                                            new SemanticKey(
+                                                    searchKey.getGolem(),
+                                                    BitUtils.convertToBits(vector.getBoolVector()),
+                                                    vector.getMem(),
+                                                    searchKey.getWeight(),
+                                                    commonMems))
+                            );
                         }
                     }
-                    return foundVectors;
-                });
+                    return allKeysFound;
+                })
+                // To eliminate problem with very wide vectors (like names or numbers), we need to group found keys
+                // by row key that they found for, and then cut only N most relevant keys. Otherwise these wide vectors
+                // obstruct all other results
+                .aggregateByKey(
+                        new ArrayList<SemanticKey>(),
+                        40,
+                        (list, elm) -> {
+                            list.add(elm);
+                            return list;
+                        },
+                        (list1, list2) -> {
+                            list1.addAll(list2);
+                            return list1;
+                        })
+                .flatMap(tuple ->
+                        tuple._2().stream()
+                                .sorted(new SemanticKeyMemsComparator())
+                                .limit(50)
+                                .collect(Collectors.toList()));
     }
 
     public static class SemanticKeyMemsComparator implements Comparator<SemanticKey>, Serializable {
@@ -207,6 +229,11 @@ public class SemanticSearch {
             // for DESC ordering comparator inverted
             return (b.getCommonMems() < a.getCommonMems()) ? -1 : ((a.getCommonMems() == b.getCommonMems()) ? 0 : 1);
         }
+    }
+
+    private static boolean checkDistance(long[] vec1, long[] vec2){
+        return BitUtils.getHammingDistance(vec1, vec2, 0, 1) < MAX_HAMMING_DIST &&
+                BitUtils.getHammingDistance(vec1, vec2, 1, vec2.length) < MAX_HAMMING_DIST;
     }
 
     private static int commonMems (int[] patternMem, int[] memVariant) {

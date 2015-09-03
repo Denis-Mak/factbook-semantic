@@ -106,4 +106,29 @@ public class SemanticKey implements Serializable {
     public void setBoolVectorAsLongs(long[] boolVectorAsLongs) {
         this.boolVectorAsLongs = boolVectorAsLongs;
     }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+
+        SemanticKey that = (SemanticKey) o;
+
+        if (golem != that.golem) return false;
+        if (weight != that.weight) return false;
+        if (commonMems != that.commonMems) return false;
+        if (!randomIndex.equals(that.randomIndex)) return false;
+        return mem.equals(that.mem);
+
+    }
+
+    @Override
+    public int hashCode() {
+        int result = golem;
+        result = 31 * result + randomIndex.hashCode();
+        result = 31 * result + mem.hashCode();
+        result = 31 * result + weight;
+        result = 31 * result + commonMems;
+        return result;
+    }
 }
