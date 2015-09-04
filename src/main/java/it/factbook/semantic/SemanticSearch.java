@@ -45,9 +45,6 @@ public class SemanticSearch {
         jsonMapper.registerModule(new JodaModule());
     }
     private static final Logger log = LoggerFactory.getLogger(SemanticSearch.class);
-    private static final int MAX_HAMMING_DIST = 34;
-    private static final int MIN_COMMON_MEMS = 4;
-    private static String _keySpace = "doccache";
 
     public static void main(String[] args) {
         Properties config = Util.readProperties();
@@ -60,17 +57,16 @@ public class SemanticSearch {
         conf.set("spark.cassandra.auth.password", config.getProperty("cassandra.password"));
         int _semanticSearchPort = Integer.parseInt(config.getProperty("semantic.search.port"));
         conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer");
-        conf.set("spark.kryoserializer.buffer.max.mb", "512");
-        _keySpace = config.getProperty("cassandra.keyspace");
-        conf.set("spark.cassandra.input.split.size_in_mb", "256");
+        conf.set("spark.kryoserializer.buffer.max", "512M");
+        conf.set("spark.cassandra.input.split.size_in_mb", "512");
         //conf.set("spark.kryo.registrationRequired", "true");
-        conf.registerKryoClasses(new Class[]{SemanticKey.class, SemanticSearchMatch.class, SemanticVector.class,
-                SemanticKeyMemsComparator.class});
+        conf.registerKryoClasses(new Class[]{SemanticKey.class, SemanticSearchWorker.SemanticSearchMatch.class,
+                SemanticVector.class, SemanticSearchWorker.SemanticKeyMemsComparator.class});
         JavaSparkContext sc = new JavaSparkContext(conf);
         Map<Integer, JavaRDD<SemanticVector>> allVectors = new HashMap<>(Golem.values().length - 1);
         for (int golemId: Golem.getValidKeys()) {
             allVectors.put(golemId, javaFunctions(sc)
-                    .cassandraTable(_keySpace, "idiom_v2")
+                    .cassandraTable("doccache", "idiom_v2")
                     .select("golem", "random_index", "mem")
                     .map(row -> new Tuple2<>(row.getInt(0), new SemanticVector(row.getString(1), row.getString(2))))
                     .filter(t -> t._1() == golemId)
@@ -80,282 +76,26 @@ public class SemanticSearch {
             log.debug("All vectors for golem: {} -> count {}", golemId, count);
         }
 
-        try (ServerSocket serverSocket = new ServerSocket(_semanticSearchPort)) {
-            while (true) {
-                try (Socket clientSocket = serverSocket.accept();
-                     PrintWriter out =
-                             new PrintWriter(clientSocket.getOutputStream(), true);
-                     BufferedReader in = new BufferedReader(
-                             new InputStreamReader(clientSocket.getInputStream()))) {
-                    String inputLine = in.readLine();
-                    if (inputLine != null) {
-                        try {
-                            JsonNode root = jsonMapper.readTree(inputLine);
-                            int action = root.get("actionCode").asInt();
-                            SearchProfile profile = jsonMapper.treeToValue(root.get("profile"), SearchProfile.class);
-                            final int golemId;
-                            if (profile.getGolems().size() > 0 &&
-                                    (golemId = profile.getGolems().iterator().next().getId()) > 0) {
-                                if (profile.getGolems().size() > 1) {
-                                    log.warn("It is impossible in this version search by multiple golem profiles. " +
-                                            "Search using golem {}", golemId);
-                                }
-                                List<SemanticKey> searchKeys = profile.getLines().stream()
-                                        .filter(line -> line.getMem().length > 0 &&
-                                                line.getRandomIndex().length > 0)
-                                        .map(line -> new SemanticKey(golemId, line.getRandomIndex(), line.getMem(), line.getWeight(), 0))
-                                        .collect(Collectors.toList());
-                                if (searchKeys.isEmpty()){
-                                    continue;
-                                }
-                                searchKeys.stream()
-                                        .forEach(e ->
-                                                log.debug("Line to search, random vector: {}, mem: {}",
-                                                        e.getRandomIndex(),
-                                                        e.getMem()));
-                                if (action == 1) {
-                                    List<Match> matches = search(allVectors.get(golemId), searchKeys);
-                                    out.println(jsonMapper.writeValueAsString(matches));
-                                } else {
-                                    List<Idiom> idioms = getSimilarIdioms(allVectors.get(golemId), searchKeys);
-                                    out.println(jsonMapper.writeValueAsString(idioms));
-                                }
-                            } else {
-                                log.error("Profile must have at least one line with valid golem.");
-                            }
-                        } catch (IOException e) {
-                            log.error("Error parse SearchProfile.class JSON: {}", e);
-                        }
-
-                    }
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            }
-        } catch (IOException e) {
-            log.error("Exception caught when trying to listen on port "
-                    + " or listening for a connection \n {}", e);
-        } finally {
-            log.info("Shutdown spark context");
-            sc.stop();
-            sc.close();
-        }
+        SemanticSearchServer semanticSearchServer = new SemanticSearchServer(_semanticSearchPort, allVectors);
+        semanticSearchServer.start();
+        // For the regular (not streaming) jobs shutdown hook doen't work
+        // leave it here before move this app to Spark Streaming
+        Runtime.getRuntime().addShutdownHook(new ShutdownHook(semanticSearchServer, log));
     }
 
-    private static List<Match> search(JavaRDD<SemanticVector> allVectors, List<SemanticKey> searchKeys){
-        JavaPairRDD<SemanticKey,SemanticSearchMatch> matchesRDD = customJavaFunctions(getSimilarIdiomKeys(allVectors, searchKeys))
-                .joinWithCassandraTable(_keySpace, "semantic_index_v2",
-                        someColumns("golem", "url", "pos", "factuality", "fingerprint", "idiom"),
-                        someColumns("golem", "random_index", "mem"),
-                        mapRowTo(SemanticSearchMatch.class),
-                        mapToRow(SemanticKey.class));
-        return matchesRDD.collect().stream()
-                .map(m -> {
-                    int factuality = m._2().factuality;
-                    int relevancy = new Long(Math.round(Math.log(1 + factuality) * m._1().getWeight() * m._1().getCommonMems())).intValue();
-                    Match match = new Match(0, relevancy);
-                    match.attrs.put("url", m._2().url);
-                    match.attrs.put("pos", m._2().pos);
-                    match.attrs.put("golem", m._2().golem);
-                    match.attrs.put("factuality", factuality);
-                    match.attrs.put("fingerprint", m._2().fingerprint);
-                    match.attrs.put("idiom", m._2().idiom);
-                    return match;
-                })
-                .collect(Collectors.toList());
-    }
+    static class ShutdownHook extends Thread {
+        SemanticSearchServer semanticSearchServer;
+        Logger log;
 
-    private static List<Idiom> getSimilarIdioms(JavaRDD<SemanticVector> allVectors, List<SemanticKey> searchKeys){
-        JavaPairRDD<SemanticKey,Idiom> idioms = javaFunctions(getSimilarIdiomKeys(allVectors, searchKeys))
-                .joinWithCassandraTable(_keySpace, "idiom_v2",
-                        someColumns("golem", "random_index", "mem", "idiom"),
-                        someColumns("golem", "random_index", "mem"),
-                        mapRowTo(Idiom.class),
-                        mapToRow(SemanticKey.class));
-        return idioms
-                .sortByKey(new SemanticKeyMemsComparator())
-                .map(pair -> {
-                    pair._2().setWeight(pair._1().getCommonMems());
-                    return pair._2();
-                }).collect();
-    }
-
-    private static JavaRDD<SemanticKey> getSimilarIdiomKeys(JavaRDD<SemanticVector> allVectors,
-                                                            List<SemanticKey> searchKeys){
-        return allVectors
-                .flatMapToPair(vector -> {
-                    List<Tuple2<String, SemanticKey>> allKeysFound = new ArrayList<>();
-                    for (SemanticKey searchKey : searchKeys) {
-                        int commonMems;
-                        if (checkDistance(vector.getBoolVector(), searchKey.getBoolVectorAsLongs()) &&
-                                (commonMems = commonMems(vector.getMem(), searchKey.getMemIntArr())) > MIN_COMMON_MEMS) {
-                            allKeysFound.add(
-                                    new Tuple2<>(searchKey.getMem(),
-                                            new SemanticKey(
-                                                    searchKey.getGolem(),
-                                                    BitUtils.convertToBits(vector.getBoolVector()),
-                                                    vector.getMem(),
-                                                    searchKey.getWeight(),
-                                                    commonMems))
-                            );
-                        }
-                    }
-                    return allKeysFound;
-                })
-                // To eliminate problem with very wide vectors (like names or numbers), we need to group found keys
-                // by row key that they found for, and then cut only N most relevant keys. Otherwise these wide vectors
-                // obstruct all other results
-                .aggregateByKey(
-                        new ArrayList<SemanticKey>(),
-                        40,
-                        (list, elm) -> {
-                            list.add(elm);
-                            return list;
-                        },
-                        (list1, list2) -> {
-                            list1.addAll(list2);
-                            return list1;
-                        })
-                .flatMap(tuple ->
-                        tuple._2().stream()
-                                .sorted(new SemanticKeyMemsComparator())
-                                .limit(50)
-                                .collect(Collectors.toList()));
-    }
-
-    public static class SemanticKeyMemsComparator implements Comparator<SemanticKey>, Serializable {
-        @Override
-        public int compare(SemanticKey a, SemanticKey b) {
-            // for DESC ordering comparator inverted
-            return (b.getCommonMems() < a.getCommonMems()) ? -1 : ((a.getCommonMems() == b.getCommonMems()) ? 0 : 1);
-        }
-    }
-
-    private static boolean checkDistance(long[] vec1, long[] vec2){
-        return BitUtils.getHammingDistance(vec1, vec2, 0, 1) < MAX_HAMMING_DIST &&
-                BitUtils.getHammingDistance(vec1, vec2, 1, vec2.length) < MAX_HAMMING_DIST;
-    }
-
-    private static int commonMems (int[] patternMem, int[] memVariant) {
-        int commonMems = 0;
-        for (int aPatternMem : patternMem) {
-            for (int aMemVariant : memVariant) {
-                if (aPatternMem == aMemVariant) {
-                    commonMems++;
-                    break;
-                }
-            }
-        }
-        return commonMems;
-    }
-
-    public static class SemanticSearchMatch implements Serializable{
-        private int golem;
-        private String url;
-        private int pos;
-        private int fingerprint;
-        private int factuality;
-        private String idiom;
-
-        public SemanticSearchMatch(int golem, String url, int pos) {
-            this.golem = golem;
-            this.url = url;
-            this.pos = pos;
-        }
-
-        public int getGolem() {
-            return golem;
-        }
-
-        public void setGolem(int golem) {
-            this.golem = golem;
-        }
-
-        public String getUrl() {
-            return url;
-        }
-
-        public void setUrl(String url) {
-            this.url = url;
-        }
-
-        public int getPos() {
-            return pos;
-        }
-
-        public void setPos(int pos) {
-            this.pos = pos;
-        }
-
-        public int getFingerprint() {
-            return fingerprint;
-        }
-
-        public void setFingerprint(int fingerprint) {
-            this.fingerprint = fingerprint;
-        }
-
-        public int getFactuality() {
-            return factuality;
-        }
-
-        public void setFactuality(int factuality) {
-            this.factuality = factuality;
-        }
-
-        public String getIdiom() {
-            return idiom;
-        }
-
-        public void setIdiom(String idiom) {
-            this.idiom = idiom;
-        }
-    }
-
-    static class CustomRDDJavaFunctions<T> extends RDDJavaFunctions<T> {
-        public CustomRDDJavaFunctions(RDD<T> rdd) {
-            super(rdd);
+        ShutdownHook(SemanticSearchServer semanticSearchServer, Logger log){
+            this.semanticSearchServer = semanticSearchServer;
+            this.log = log;
         }
 
         @Override
-        public <R> CassandraJavaPairRDD<T, R> joinWithCassandraTable(
-                String keyspaceName,
-                String tableName,
-                ColumnSelector selectedColumns,
-                ColumnSelector joinColumns,
-                RowReaderFactory<R> rowReaderFactory,
-                RowWriterFactory<T> rowWriterFactory
-        ) {
-            ClassTag<T> classTagT = rdd.toJavaRDD().classTag();
-            ClassTag<R> classTagR = JavaApiHelper.getClassTag(rowReaderFactory.targetClass());
-
-            CassandraConnector connector = defaultConnector();
-            Option<ClusteringOrder> clusteringOrder = Option.empty();
-            Option<Object> limit = Option.apply(1000L);
-            CqlWhereClause whereClause = CqlWhereClause.empty();
-            ReadConf readConf = ReadConf.fromSparkConf(rdd.conf());
-
-            CassandraJoinRDD<T, R> joinRDD = new CassandraJoinRDD<>(
-                    rdd,
-                    keyspaceName,
-                    tableName,
-                    connector,
-                    selectedColumns,
-                    joinColumns,
-                    whereClause,
-                    limit,
-                    clusteringOrder,
-                    readConf,
-                    classTagT,
-                    classTagR,
-                    rowWriterFactory,
-                    rowReaderFactory);
-
-            return new CassandraJavaPairRDD<>(joinRDD, classTagT, classTagR);
+        public void run() {
+            System.out.println("Shutdown SemanticSearchServer");
+            semanticSearchServer.stop();
         }
-    }
-
-    private static <T> RDDJavaFunctions<T> customJavaFunctions(JavaRDD<T> rdd) {
-        return new CustomRDDJavaFunctions<>(rdd.rdd());
     }
 }
