@@ -1,5 +1,6 @@
 package it.factbook.semantic;
 
+import com.datastax.spark.connector.cql.CassandraConnector;
 import org.apache.spark.api.java.JavaRDD;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,9 +21,13 @@ public class SemanticSearchServer{
 
     private Map<Integer, JavaRDD<SemanticVector>> allVectors;
 
-    public SemanticSearchServer(int port, Map<Integer, JavaRDD<SemanticVector>> allVectors){
+    private CassandraConnector cassandraConnector;
+
+    public SemanticSearchServer(int port, Map<Integer, JavaRDD<SemanticVector>> allVectors,
+                                CassandraConnector cassandraConnector){
         this.listenPort = port;
         this.allVectors = allVectors;
+        this.cassandraConnector = cassandraConnector;
     }
 
     public void start() {
@@ -37,7 +42,7 @@ public class SemanticSearchServer{
             try {
                 Socket clientSocket = serverSocket.accept();
                 new Thread(
-                        new SemanticSearchWorker(clientSocket, allVectors)
+                        new SemanticSearchWorker(clientSocket, allVectors, cassandraConnector)
                 ).start();
             } catch (IOException e) {
                 if (isStopped) {

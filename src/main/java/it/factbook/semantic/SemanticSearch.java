@@ -2,6 +2,7 @@ package it.factbook.semantic;
 
 import com.datastax.spark.connector.ColumnSelector;
 import com.datastax.spark.connector.cql.CassandraConnector;
+import com.datastax.spark.connector.cql.CassandraConnector$;
 import com.datastax.spark.connector.japi.RDDJavaFunctions;
 import com.datastax.spark.connector.japi.rdd.CassandraJavaPairRDD;
 import com.datastax.spark.connector.rdd.CassandraJoinRDD;
@@ -59,6 +60,7 @@ public class SemanticSearch {
         conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer");
         conf.set("spark.kryoserializer.buffer.max", "512M");
         conf.set("spark.cassandra.input.split.size_in_mb", "512");
+        conf.set("spark.cassandra.connection.keep_alive_ms", "2000");
         //conf.set("spark.kryo.registrationRequired", "true");
         conf.registerKryoClasses(new Class[]{SemanticKey.class, SemanticSearchWorker.SemanticSearchMatch.class,
                 SemanticVector.class, SemanticSearchWorker.SemanticKeyMemsComparator.class});
@@ -72,11 +74,11 @@ public class SemanticSearch {
                     .filter(t -> t._1() == golemId)
                     .map(Tuple2::_2)
                     .persist(StorageLevel.MEMORY_ONLY_SER()));
-            long count = allVectors.get(golemId).count();
-            log.debug("All vectors for golem: {} -> count {}", golemId, count);
+            //long count = allVectors.get(golemId).count();
+            //log.debug("All vectors for golem: {} -> count {}", golemId, count);
         }
-
-        SemanticSearchServer semanticSearchServer = new SemanticSearchServer(_semanticSearchPort, allVectors);
+        CassandraConnector cassandraConnector = CassandraConnector$.MODULE$.apply(sc.getConf());
+        SemanticSearchServer semanticSearchServer = new SemanticSearchServer(_semanticSearchPort, allVectors, cassandraConnector);
         semanticSearchServer.start();
         // For the regular (not streaming) jobs shutdown hook doen't work
         // leave it here before move this app to Spark Streaming
