@@ -2,7 +2,7 @@ package it.factbook.semantic;
 
 import java.io.Serializable;
 
-public final class SemanticIndexRow implements Serializable {
+public class SemanticIndexRow implements Serializable {
     private int golem;
     private String randomIndex;
     private String mem;
@@ -11,6 +11,7 @@ public final class SemanticIndexRow implements Serializable {
     private int factuality;
     private int fingerprint;
     private String idiom;
+    private int frequency;
 
     public int getGolem() {
         return golem;
@@ -74,6 +75,14 @@ public final class SemanticIndexRow implements Serializable {
 
     public void setIdiom(String idiom) {
         this.idiom = idiom;
+    }
+
+    public int getFrequency() {
+        return frequency;
+    }
+
+    public void setFrequency(int frequency) {
+        this.frequency = frequency;
     }
 
     @Override

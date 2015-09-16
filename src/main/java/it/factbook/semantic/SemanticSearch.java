@@ -1,44 +1,23 @@
 package it.factbook.semantic;
 
-import com.datastax.spark.connector.ColumnSelector;
 import com.datastax.spark.connector.cql.CassandraConnector;
 import com.datastax.spark.connector.cql.CassandraConnector$;
-import com.datastax.spark.connector.japi.RDDJavaFunctions;
-import com.datastax.spark.connector.japi.rdd.CassandraJavaPairRDD;
-import com.datastax.spark.connector.rdd.CassandraJoinRDD;
-import com.datastax.spark.connector.rdd.ClusteringOrder;
-import com.datastax.spark.connector.rdd.CqlWhereClause;
-import com.datastax.spark.connector.rdd.ReadConf;
-import com.datastax.spark.connector.rdd.reader.RowReaderFactory;
-import com.datastax.spark.connector.util.JavaApiHelper;
-import com.datastax.spark.connector.writer.RowWriterFactory;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.joda.JodaModule;
 import it.factbook.dictionary.Golem;
-import it.factbook.search.SearchProfile;
-import it.factbook.search.repository.Idiom;
-import it.factbook.search.repository.Match;
-import it.factbook.util.BitUtils;
 import org.apache.spark.SparkConf;
-import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
-import org.apache.spark.rdd.RDD;
 import org.apache.spark.storage.StorageLevel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import scala.Option;
 import scala.Tuple2;
-import scala.reflect.ClassTag;
 
-import java.io.*;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.util.*;
-import java.util.stream.Collectors;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Properties;
 
-import static com.datastax.spark.connector.japi.CassandraJavaUtil.*;
+import static com.datastax.spark.connector.japi.CassandraJavaUtil.javaFunctions;
 
 public class SemanticSearch {
     private static final ObjectMapper jsonMapper = new ObjectMapper();
@@ -65,22 +44,25 @@ public class SemanticSearch {
         conf.registerKryoClasses(new Class[]{SemanticKey.class, SemanticSearchWorker.SemanticSearchMatch.class,
                 SemanticVector.class, SemanticSearchWorker.SemanticKeyMemsComparator.class});
         JavaSparkContext sc = new JavaSparkContext(conf);
-        Map<Integer, JavaRDD<SemanticVector>> allVectors = new HashMap<>(Golem.values().length - 1);
+        // Use here a list only because it is not possible to use arrays with generics,
+        // and using list for vectors collection a little bit faster than a map
+        List<JavaRDD<SemanticVector>> allVectors = new ArrayList<>(Golem.values().length);
+        for (int i = 0; i < Golem.values().length; i++){
+            allVectors.add(null);
+        }
         for (int golemId: Golem.getValidKeys()) {
-            allVectors.put(golemId, javaFunctions(sc)
+            allVectors.set(golemId, javaFunctions(sc)
                     .cassandraTable("doccache", "idiom_v2")
                     .select("golem", "random_index", "mem")
                     .map(row -> new Tuple2<>(row.getInt(0), new SemanticVector(row.getString(1), row.getString(2))))
                     .filter(t -> t._1() == golemId)
                     .map(Tuple2::_2)
                     .persist(StorageLevel.MEMORY_ONLY_SER()));
-            //long count = allVectors.get(golemId).count();
-            //log.debug("All vectors for golem: {} -> count {}", golemId, count);
         }
         CassandraConnector cassandraConnector = CassandraConnector$.MODULE$.apply(sc.getConf());
-        SemanticSearchServer semanticSearchServer = new SemanticSearchServer(_semanticSearchPort, allVectors, cassandraConnector);
+        SemanticSearchServer semanticSearchServer = new SemanticSearchServer(_semanticSearchPort, allVectors, cassandraConnector, sc);
         semanticSearchServer.start();
-        // For the regular (not streaming) jobs shutdown hook doen't work
+        // For the regular (not streaming) jobs shutdown hook doesn't work
         // leave it here before move this app to Spark Streaming
         Runtime.getRuntime().addShutdownHook(new ShutdownHook(semanticSearchServer, log));
     }

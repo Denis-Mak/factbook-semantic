@@ -53,8 +53,8 @@ public class BuildSemanticIndex {
         SparkConf conf = new SparkConf();
         conf.setAppName("Build Semantic Index");
         conf.setMaster(config.getProperty("spark.master"));
-        conf.set("spark.executor.memory", "9G");
-        conf.set("spark.driver.memory", "9G");
+        conf.set("spark.executor.memory", config.getProperty("spark.executor.memory"));
+        conf.set("spark.driver.memory", config.getProperty("spark.driver.memory"));
         conf.set("spark.cassandra.connection.host", config.getProperty("cassandra.host"));
         conf.set("spark.cassandra.auth.username", config.getProperty("cassandra.user"));
         conf.set("spark.cassandra.auth.password", config.getProperty("cassandra.password"));
