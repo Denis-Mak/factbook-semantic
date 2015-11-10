@@ -2,14 +2,15 @@ package it.factbook.semantic;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import it.factbook.dictionary.Stem;
 import it.factbook.util.BitUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
-import java.util.Arrays;
 
+/**
+ * Container that contains a key to query facts from semantic_index_v2
+ */
 public class SemanticKey implements Serializable {
     private static final ObjectMapper jsonMapper = new ObjectMapper();
     private static final Logger log = LoggerFactory.getLogger(SemanticKey.class);
@@ -21,9 +22,9 @@ public class SemanticKey implements Serializable {
     private String mem;
     private int[] memIntArr;
     private int weight;
-    private int commonMems;
+    private int foundInLine;
 
-    public SemanticKey(int golem, boolean[] boolVector, int[] mem, int weight, int commonMems) {
+    public SemanticKey(int golem, boolean[] boolVector, int[] mem, int weight, int foundInLine) {
         this.golem = golem;
         this.boolVectorAsLongs = BitUtils.convertToLongArray(boolVector);
         this.randomIndex = BitUtils.sparseVectorHash(boolVector, false);
@@ -34,21 +35,7 @@ public class SemanticKey implements Serializable {
         }
         this.memIntArr = mem;
         this.weight = weight;
-        this.commonMems = commonMems;
-    }
-
-    public SemanticKey(int golem, String randomIndex, int[] mem, int weight, int commonMems) {
-        this.golem = golem;
-        this.boolVectorAsLongs = BitUtils.convertToLongArray(BitUtils.reverseHash(randomIndex, Stem.RI_VECTOR_LENGTH));
-        this.randomIndex = randomIndex;
-        try {
-            this.mem = jsonMapper.writeValueAsString(mem);
-        } catch (JsonProcessingException e) {
-            log.error("Exeption in parsing mem");
-        }
-        this.memIntArr = mem;
-        this.weight = weight;
-        this.commonMems = commonMems;
+        this.foundInLine = foundInLine;
     }
 
     public int getGolem() {
@@ -83,12 +70,12 @@ public class SemanticKey implements Serializable {
         this.weight = weight;
     }
 
-    public int getCommonMems() {
-        return commonMems;
+    public int getFoundInLine() {
+        return foundInLine;
     }
 
-    public void setCommonMems(int commonMems) {
-        this.commonMems = commonMems;
+    public void setFoundInLine(int foundInLine) {
+        this.foundInLine = foundInLine;
     }
 
     public String getRandomIndex() {
@@ -116,7 +103,7 @@ public class SemanticKey implements Serializable {
 
         if (golem != that.golem) return false;
         if (weight != that.weight) return false;
-        if (commonMems != that.commonMems) return false;
+        if (foundInLine != that.foundInLine) return false;
         if (!randomIndex.equals(that.randomIndex)) return false;
         return mem.equals(that.mem);
 
@@ -128,7 +115,7 @@ public class SemanticKey implements Serializable {
         result = 31 * result + randomIndex.hashCode();
         result = 31 * result + mem.hashCode();
         result = 31 * result + weight;
-        result = 31 * result + commonMems;
+        result = 31 * result + foundInLine;
         return result;
     }
 }

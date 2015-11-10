@@ -18,6 +18,10 @@ import static com.datastax.spark.connector.japi.CassandraJavaUtil.classTag;
 import static com.datastax.spark.connector.japi.CassandraJavaUtil.javaFunctions;
 import static com.datastax.spark.connector.japi.CassandraJavaUtil.mapToRow;
 
+/**
+ * Spark job for building a part of semantic index - index of idioms. This job fulfilled idiom_v2 table
+ * from semantic_index_v2 grouping by keys (golem, random_index, mem).
+ */
 public class BuildIdiomIndex {
 
     public static void main(String[] args) {
@@ -32,7 +36,7 @@ public class BuildIdiomIndex {
         conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer");
         conf.set("spark.kryo.registrationRequired", "true");
         conf.set("spark.kryoserializer.buffer.max", "512M");
-        conf.set("spark.executor.memory", "8G");
+        conf.set("spark.executor.memory", config.getProperty("spark.executor.memory"));
         //conf.set("spark.default.parallelism", "4");
         //conf.set("spark.cassandra.input.split.size_in_mb", "10");
         conf.registerKryoClasses(new Class[]{SemanticIndexRow.class});

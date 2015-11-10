@@ -1,7 +1,5 @@
 package it.factbook.semantic;
 
-import com.datastax.driver.core.PreparedStatement;
-import com.datastax.driver.core.Session;
 import com.datastax.spark.connector.ColumnSelector;
 import com.datastax.spark.connector.cql.CassandraConnector;
 import com.datastax.spark.connector.japi.RDDJavaFunctions;
@@ -35,14 +33,17 @@ import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
 import java.util.stream.Collectors;
 
 import static com.datastax.spark.connector.japi.CassandraJavaUtil.*;
 
+/**
+ * Class that performs semantic search.
+ */
 class SemanticSearchWorker implements Runnable {
     private static final int MAX_HAMMING_DIST = 16;
     private static final int MIN_COMMON_MEMS = 4;
+    private static final long MAX_RESULTS_PER_RDD = 2000L;
 
     private static final Logger log = LoggerFactory.getLogger(SemanticSearchWorker.class);
     private static final ObjectMapper jsonMapper = new ObjectMapper();
@@ -59,6 +60,14 @@ class SemanticSearchWorker implements Runnable {
 
     private JavaSparkContext sparkContext;
 
+    /**
+     * Creates an instance of SemanticSearchWorker to run in a thread
+     *
+     * @param clientSocket socket where to return results
+     * @param allVectors collection of all possible idioms
+     * @param cassandraConnector an instance of {@link CassandraConnector} to read from database
+     * @param sc spark context to perform operation in Spark
+     */
     public SemanticSearchWorker(Socket clientSocket, List<JavaRDD<SemanticVector>> allVectors,
                                 CassandraConnector cassandraConnector, JavaSparkContext sc) {
         this.clientSocket = clientSocket;
@@ -67,6 +76,10 @@ class SemanticSearchWorker implements Runnable {
         this.sparkContext = sc;
     }
 
+    /**
+     * Main entry point reads and parses a JSON message from socket. If there is no errors with the message it runs
+     * semantic search tasks. In case of errors it writes messages to the log and closes socket.
+     */
     @Override
     public void run() {
         log.debug("Get request");
@@ -127,13 +140,19 @@ class SemanticSearchWorker implements Runnable {
         }
     }
 
+    /**
+     * Searches facts that contains semantically close idioms to the ones from the profile.
+     * All found synonyms are rated by proximity to the queried and content-richness.
+     *
+     * @param allVectors collection of all possible idioms
+     * @param searchKeys idioms from the profile packed into {@link SemanticKey} containers
+     * @param cassandraConnector an instance of {@link CassandraConnector} to read from database
+     * @return list of found matches
+     */
     private List<Match> search(JavaRDD<SemanticVector> allVectors, List<SemanticKey> searchKeys,
                                       CassandraConnector cassandraConnector) {
-        List<SemanticKey> keys = getSimilarIdiomKeys(allVectors, searchKeys, cassandraConnector)
-                .sortBy(SemanticKey::getWeight, false, 0).take(3000);
-        log.debug("Found {} semantic keys", keys.size());
-        keys.forEach(key -> log.debug("key {} weight {}", key.getMem(), key.getWeight()));
-        JavaPairRDD<SemanticKey, SemanticSearchMatch> matchesRDD = customJavaFunctions(sparkContext.parallelize(keys))
+        JavaPairRDD<SemanticKey, SemanticSearchMatch> matchesRDD =
+                customJavaFunctions(getSimilarIdiomKeys(allVectors, searchKeys, cassandraConnector))
                 .joinWithCassandraTable("doccache", "semantic_index_v2",
                         someColumns("golem", "url", "pos", "factuality", "fingerprint", "idiom"),
                         someColumns("golem", "random_index", "mem"),
@@ -144,7 +163,7 @@ class SemanticSearchWorker implements Runnable {
         return matchesList.stream()
                 .map(m -> {
                     int factuality = m._2().factuality;
-                    int relevancy = new Long(Math.round(Math.log(1 + factuality) * m._1().getWeight() * m._1().getCommonMems())).intValue();
+                    int relevancy = new Long(Math.round(Math.log(1 + factuality) * m._1().getWeight())).intValue();
                     Match match = new Match(0, relevancy);
                     match.attrs.put("url", m._2().url);
                     match.attrs.put("pos", m._2().pos);
@@ -157,6 +176,14 @@ class SemanticSearchWorker implements Runnable {
                 .collect(Collectors.toList());
     }
 
+    /**
+     * Searches synonyms of the provided idioms.
+     *
+     * @param allVectors collection of all possible idioms
+     * @param searchKeys idioms from the profile packed into {@link SemanticKey} containers
+     * @param cassandraConnector an instance of {@link CassandraConnector} to read from database
+     * @return list of found idioms ordered by count of common mems
+     */
     private static List<Idiom> getSimilarIdioms(JavaRDD<SemanticVector> allVectors, List<SemanticKey> searchKeys,
                                                 CassandraConnector cassandraConnector) {
         JavaPairRDD<SemanticKey, Idiom> idioms = javaFunctions(getSimilarIdiomKeys(allVectors, searchKeys, cassandraConnector))
@@ -165,19 +192,31 @@ class SemanticSearchWorker implements Runnable {
                         someColumns("golem", "random_index", "mem"),
                         mapRowTo(Idiom.class),
                         mapToRow(SemanticKey.class));
-        return idioms
-                .sortByKey(new SemanticKeyMemsComparator())
+        SemanticKeyWeightComparator comparator = new SemanticKeyWeightComparator();
+        return idioms.collect().stream()
+                .sorted((p1, p2) -> comparator.compare(p1._1(), p2._1()))
                 .map(pair -> {
-                    pair._2().setWeight(pair._1().getCommonMems());
-                    return pair._2();
-                }).collect();
+                    Idiom idiom = pair._2();
+                    idiom.setWeight(pair._1().getWeight());
+                    return idiom;
+                })
+                .collect(Collectors.toList());
     }
 
+    /**
+     * Find close by sense idioms comparing random vectors and mems
+     *
+     * @param allVectors collection of all possible idioms known by the system
+     * @param searchKeys collection of idioms from the profile using as keys for searching
+     * @param cassandraConnector an instance of {@link CassandraConnector} to read/write from database
+     * @return collection of found keys (golem + random_vector + mem) close enough to the queried
+     */
     private static JavaRDD<SemanticKey> getSimilarIdiomKeys(final JavaRDD<SemanticVector> allVectors,
                                                             final List<SemanticKey> searchKeys,
                                                             CassandraConnector cassandraConnector) {
         return allVectors
                 .map(vector -> {
+                    int foundInLine = 0;
                     SemanticKey foundKey = null;
                     for (SemanticKey searchKey : searchKeys) {
                         int commonMems;
@@ -185,38 +224,67 @@ class SemanticSearchWorker implements Runnable {
                                 (commonMems = commonMems(vector.getMem(), searchKey.getMemIntArr(), MIN_COMMON_MEMS)) > MIN_COMMON_MEMS) {
                             if (foundKey == null) {
                                 foundKey = new SemanticKey(
-                                                searchKey.getGolem(),
-                                                BitUtils.convertToBits(vector.getBoolVector()),
-                                                vector.getMem(),
-                                                searchKey.getWeight(),
-                                                commonMems);
-                            } else {
+                                        searchKey.getGolem(),
+                                        BitUtils.convertToBits(vector.getBoolVector()),
+                                        vector.getMem(),
+                                        searchKey.getWeight() * commonMems,
+                                        foundInLine);
+                            }else {
                                 foundKey.setWeight(foundKey.getWeight() + searchKey.getWeight());
                             }
                         }
-                    }
-                    // Multiply by max common mems count to get in top more close synonyms
-                    if (foundKey != null){
-                        foundKey.setWeight(foundKey.getWeight() * foundKey.getCommonMems());
+                        foundInLine++;
                     }
                     return foundKey;
                 })
-                .filter(vector -> vector != null);
+                .filter(vector -> vector != null)
+                .mapToPair(key -> new Tuple2<>(key.getFoundInLine(), key))
+                .aggregateByKey(
+                        new ArrayList<SemanticKey>(),
+                        40,
+                        (list, elm) -> {
+                            list.add(elm);
+                            return list;
+                        },
+                        (list1, list2) -> {
+                            list1.addAll(list2);
+                            return list1;
+                        })
+                .flatMap(tuple ->
+                        tuple._2().stream()
+                                .sorted(new SemanticKeyWeightComparator())
+                                .limit(50)
+                                .collect(Collectors.toList()));
     }
 
-    public static class SemanticKeyMemsComparator implements Comparator<SemanticKey>, Serializable {
+    public static class SemanticKeyWeightComparator implements Comparator<SemanticKey>, Serializable {
         @Override
         public int compare(SemanticKey a, SemanticKey b) {
             // for DESC ordering comparator inverted
-            return (b.getCommonMems() < a.getCommonMems()) ? -1 : ((a.getCommonMems() == b.getCommonMems()) ? 0 : 1);
+            return (b.getWeight() < a.getWeight()) ? -1 : ((a.getWeight() == b.getWeight()) ? 0 : 1);
         }
     }
 
+    /**
+     * Checks if hamming distance between two vectors is close enough to consider them as synonyms
+     *
+     * @param vec1 vector one
+     * @param vec2 vector two
+     * @return true if distance between the vectors is lower then {@link #MAX_HAMMING_DIST}
+     */
     private static boolean checkDistance(long[] vec1, long[] vec2) {
         return BitUtils.getHammingDistance(vec1, vec2, 0, 1, MAX_HAMMING_DIST) < MAX_HAMMING_DIST &&
                 BitUtils.getHammingDistance(vec1, vec2, 1, vec2.length, MAX_HAMMING_DIST) < MAX_HAMMING_DIST;
     }
 
+    /**
+     * Count same memIds in two vectors
+     *
+     * @param patternMem vector one
+     * @param memVariant vector two
+     * @param minCommonMems minimum count if it is not possible to reach it calculation stops
+     * @return count of the same memIds
+     */
     static int commonMems(int[] patternMem, int[] memVariant, int minCommonMems) {
         int commonMems = 0;
         for (int i = 0, n = patternMem.length; i < n; i++) {
@@ -235,6 +303,9 @@ class SemanticSearchWorker implements Runnable {
         return commonMems;
     }
 
+    /**
+     * Container of temporary matches, this bean is needed to perform mapping in the Cassandra-Spark connector
+     */
     public static class SemanticSearchMatch implements Serializable {
         private int golem;
         private String url;
@@ -298,6 +369,10 @@ class SemanticSearchWorker implements Runnable {
         }
     }
 
+    /**
+     * This class is overridden to specify limit in join, otherwise task crashes on the very "wide" synonyms
+     * @param <T>
+     */
     static class CustomRDDJavaFunctions<T> extends RDDJavaFunctions<T> {
         public CustomRDDJavaFunctions(RDD<T> rdd) {
             super(rdd);
@@ -317,7 +392,7 @@ class SemanticSearchWorker implements Runnable {
 
             CassandraConnector connector = defaultConnector();
             Option<ClusteringOrder> clusteringOrder = Option.empty();
-            Option<Object> limit = Option.apply(1000L);
+            Option<Object> limit = Option.apply(MAX_RESULTS_PER_RDD);
             CqlWhereClause whereClause = CqlWhereClause.empty();
             ReadConf readConf = ReadConf.fromSparkConf(rdd.conf());
 

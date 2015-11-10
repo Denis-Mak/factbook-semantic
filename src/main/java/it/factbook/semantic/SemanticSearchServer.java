@@ -10,8 +10,10 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.List;
-import java.util.Map;
 
+/**
+ * Server-side socket listener that accept incoming requests and runs asynchronously semantic search tasks.
+ */
 public class SemanticSearchServer{
     private static final Logger log = LoggerFactory.getLogger(SemanticSearchServer.class);
 

@@ -20,6 +20,10 @@ import java.util.*;
 
 import static com.datastax.spark.connector.japi.CassandraJavaUtil.*;
 
+/**
+ * Spark job that finds and removes top by frequency in texts idioms, typically names of people or places that
+ * are not much efficient for semantic searching.
+ */
 public class RemoveFrequentMems {
     private static final Logger log = LoggerFactory.getLogger(RemoveFrequentMems.class);
 

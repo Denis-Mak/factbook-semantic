@@ -11,7 +11,7 @@ import it.factbook.dictionary.repository.inmemory.StemAdapterInMemoryImpl;
 import it.factbook.dictionary.repository.inmemory.WordFormAdapterInMemoryImpl;
 import it.factbook.search.Fact;
 import it.factbook.search.FactProcessor;
-import it.factbook.search.repository.jdbc.ClassifierAdapterImpl;
+import it.factbook.search.classifier.ClassifierAdapterImpl;
 import it.factbook.util.BitUtils;
 import it.factbook.util.TextSplitterOpenNlpRuImpl;
 import org.apache.spark.SparkConf;
@@ -25,6 +25,9 @@ import java.util.*;
 import static com.datastax.spark.connector.japi.CassandraJavaUtil.javaFunctions;
 import static com.datastax.spark.connector.japi.CassandraJavaUtil.mapToRow;
 
+/**
+ * Spark job that builds the first part of semantic index - what fact contains what mem.
+ */
 public class BuildSemanticIndex {
     private static final ObjectMapper jsonMapper = new ObjectMapper();
     private static final Logger log = LoggerFactory.getLogger(BuildSemanticIndex.class);
@@ -99,7 +102,7 @@ public class BuildSemanticIndex {
                         FactProcessor factProcessor = FactProcessorWrapper.getFactProcessor();
                         List<WordForm[]> factIdioms = factProcessor.getIdioms(
                                 factProcessor.getTrees(f.getGolem(), f.getContent()));
-                        List<int[]> sense = factProcessor.convertToSense(factIdioms);
+                        List<int[]> sense = factProcessor.getSense(factIdioms);
                         StemAdapter stemAdapter = factProcessor.getStemAdapter();
                         List<SemanticIndexRow> rows = new ArrayList<>(factIdioms.size());
                         for (int i = 0; i < factIdioms.size(); i++) {

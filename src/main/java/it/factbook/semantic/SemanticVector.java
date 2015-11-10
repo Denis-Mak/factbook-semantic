@@ -1,9 +1,5 @@
 package it.factbook.semantic;
 
-import com.esotericsoftware.kryo.Kryo;
-import com.esotericsoftware.kryo.KryoSerializable;
-import com.esotericsoftware.kryo.io.Input;
-import com.esotericsoftware.kryo.io.Output;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.joda.JodaModule;
@@ -16,6 +12,9 @@ import java.io.IOException;
 import java.io.Serializable;
 import java.util.Arrays;
 
+/**
+ * Container to keep idiom's properties used for searching in memory
+ */
 public class SemanticVector implements Serializable{
     private static final ObjectMapper jsonMapper = new ObjectMapper();
     static {

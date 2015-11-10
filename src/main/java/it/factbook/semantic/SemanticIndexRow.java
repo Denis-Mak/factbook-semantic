@@ -2,6 +2,10 @@ package it.factbook.semantic;
 
 import java.io.Serializable;
 
+/**
+ * Container of one row of the table semantic_index_v2 it is more convenient way to use beans with Cassandra driver for Spark
+ * then a mapper.
+ */
 public class SemanticIndexRow implements Serializable {
     private int golem;
     private String randomIndex;

@@ -19,6 +19,10 @@ import java.util.Properties;
 
 import static com.datastax.spark.connector.japi.CassandraJavaUtil.javaFunctions;
 
+/**
+ * Spark job that runs server for processing requests and performing searches.
+ * Before running server it reads all content of idioms_v2 table into memory.
+ */
 public class SemanticSearch {
     private static final ObjectMapper jsonMapper = new ObjectMapper();
     static {
@@ -42,7 +46,7 @@ public class SemanticSearch {
         conf.set("spark.cassandra.connection.keep_alive_ms", "2000");
         //conf.set("spark.kryo.registrationRequired", "true");
         conf.registerKryoClasses(new Class[]{SemanticKey.class, SemanticSearchWorker.SemanticSearchMatch.class,
-                SemanticVector.class, SemanticSearchWorker.SemanticKeyMemsComparator.class});
+                SemanticVector.class, SemanticSearchWorker.SemanticKeyWeightComparator.class});
         JavaSparkContext sc = new JavaSparkContext(conf);
         // Use here a list only because it is not possible to use arrays with generics,
         // and using list for vectors collection a little bit faster than a map
